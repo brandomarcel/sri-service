@@ -1,17 +1,57 @@
 import * as soap from 'soap';
+import { isIP } from 'net';
+
+type SriOperation = 'recepcion' | 'autorizacion';
+
+/**
+ * The SOAP endpoint must come from our configuration, not from soap:address in
+ * the remote WSDL. node-soap otherwise initializes each port with that value.
+ */
+export function endpointFromWsdl(wsdlUrl: string): string {
+  const url = new URL(wsdlUrl);
+
+  if (url.protocol !== 'https:') {
+    throw new Error(`La URL WSDL del SRI debe usar HTTPS: ${wsdlUrl}`);
+  }
+  if (isIP(url.hostname)) {
+    throw new Error(`La URL WSDL del SRI debe usar un dominio, no una IP: ${wsdlUrl}`);
+  }
+
+  url.search = '';
+  url.hash = '';
+  return url.toString().replace(/\/$/, '');
+}
+
+async function createSriClient(wsdlUrl: string, operation: SriOperation) {
+  const endpoint = endpointFromWsdl(wsdlUrl);
+
+  console.info(`[SRI SOAP][${operation}] WSDL URL: ${wsdlUrl}`);
+  const client = await soap.createClientAsync(wsdlUrl);
+
+  // Do not trust the possibly stale/incorrect soap:address embedded in WSDL.
+  client.setEndpoint(endpoint);
+  console.info(`[SRI SOAP][${operation}] client endpoint: ${endpoint}`);
+
+  return { client, endpoint };
+}
 
 export async function recepcion(wsdlUrl: string, xmlSigned: string) {
-  const client = await soap.createClientAsync(wsdlUrl);
+  const { client, endpoint } = await createSriClient(wsdlUrl, 'recepcion');
   const xmlB64 = Buffer.from(xmlSigned, 'utf8').toString('base64');
+  console.info(`[SRI SOAP][recepcion] request URL: ${endpoint}`);
   const [resp] = await (client as any).validarComprobanteAsync({ xml: xmlB64 });
   return resp;
 }
 
 export async function autorizacion(wsdlUrl: string, accessKey: string) {
-  const client = await soap.createClientAsync(wsdlUrl);
+  const { client, endpoint } = await createSriClient(wsdlUrl, 'autorizacion');
   const fn =
     (client as any).autorizacionComprobantesAsync ??
     (client as any).autorizacionComprobanteAsync;
+  if (typeof fn !== 'function') {
+    throw new Error('El WSDL del SRI no expone una operación de autorización compatible.');
+  }
+  console.info(`[SRI SOAP][autorizacion] request URL: ${endpoint}`);
   const [resp] = await fn({ claveAccesoComprobante: accessKey });
   return resp;
 }
