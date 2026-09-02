@@ -337,7 +337,7 @@ app.get('/api/v1/invoices/:accessKey/status', async (req, res) => {
 
     // Helper para consultar un ambiente específico
     const checkEnv = async (amb: 'test' | 'prod') => {
-      const urls = getSriConfig(amb); // <-- usar la util que ya tienes
+      const urls = getSriUrls(amb);
       if (!urls.autorizacion) {
         return {
           status: 'ERROR' as const,
@@ -345,8 +345,10 @@ app.get('/api/v1/invoices/:accessKey/status', async (req, res) => {
           environment: amb,
         };
       }
-	  const { recepcion: recepcionUrl, autorizacion: autorizacionUrl } = getSriUrls(env);
-  	  
+      console.info(
+        `[SRI STATUS] consulta autorización environment=${amb} ` +
+        `endpoint=${urls.autorizacion} accessKey=${accessKey}`
+      );
       const authResponse = await autorizacion(urls.autorizacion, accessKey);
       const parsed = parseAutorizacion(authResponse);
 

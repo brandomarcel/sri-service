@@ -389,7 +389,7 @@ export async function emitirFactura(payload: any): Promise<EmitInvoiceOutput> {
   }
 }
 
-const authorizationJobs = new Map<string, Promise<void>>();
+const authorizationJobs = new Map<string, Promise<CachedResponse>>();
 
 function queueAuthorizationPolling(params: {
   idempotencyKey: string;
@@ -398,8 +398,9 @@ function queueAuthorizationPolling(params: {
   signedXml: string;
   payloadHash: string;
   environment: string;
-}): void {
-  if (authorizationJobs.has(params.idempotencyKey)) return;
+}): Promise<CachedResponse> {
+  const existingJob = authorizationJobs.get(params.idempotencyKey);
+  if (existingJob) return existingJob;
 
   const job = (async () => {
     try {
@@ -425,7 +426,7 @@ function queueAuthorizationPolling(params: {
           `status=PROCESSING message=${out.messages?.join(' | ') || 'none'}`
         );
         await setCachedResponse(params.idempotencyKey, out, 24 * 60 * 60);
-        return;
+        return out;
       }
 
       if (parsed.estado === 'NO AUTORIZADO') {
@@ -439,7 +440,7 @@ function queueAuthorizationPolling(params: {
           payload_hash: params.payloadHash
         };
         await setCachedResponse(params.idempotencyKey, out, 24 * 60 * 60);
-        return;
+        return out;
       }
 
       const out: CachedResponse = {
@@ -454,6 +455,7 @@ function queueAuthorizationPolling(params: {
         payload_hash: params.payloadHash
       };
       await setCachedResponse(params.idempotencyKey, out, 24 * 60 * 60);
+      return out;
     } catch (error) {
       const out = sriErrorResponse(error, params.accessKey, params.payloadHash);
       await setCachedResponse(params.idempotencyKey, out, 24 * 60 * 60);
@@ -462,12 +464,14 @@ function queueAuthorizationPolling(params: {
         `environment=${params.environment} accessKey=${params.accessKey} ` +
         `code=${out.code || 'SRI_CONNECTION_ERROR'}`
       );
+      return out as CachedResponse;
     }
   })().finally(() => {
     authorizationJobs.delete(params.idempotencyKey);
   });
 
   authorizationJobs.set(params.idempotencyKey, job);
+  return job;
 }
 
 async function emitirFacturaInternal(payload: any): Promise<EmitInvoiceOutput> {
@@ -539,7 +543,7 @@ const numericCode =
       `message=${processing.messages?.join(' | ') || 'none'}`
     );
     await setCachedResponse(idempotencyKey, processing, 24 * 60 * 60);
-    queueAuthorizationPolling({
+    const authorizationJob = queueAuthorizationPolling({
       idempotencyKey,
       authorizationUrl: autorizacionUrl,
       accessKey: accessKey!,
@@ -547,6 +551,14 @@ const numericCode =
       payloadHash: reqHash,
       environment: env
     });
+
+    // Dar una ventana corta para que Frappe reciba AUTORIZADO si el SRI ya
+    // terminó el procesamiento; el polling continúa fuera de la petición.
+    const completed = await Promise.race([
+      authorizationJob,
+      new Promise<CachedResponse | null>((resolve) => setTimeout(() => resolve(null), 7000))
+    ]);
+    if (completed && completed.status !== 'PROCESSING') return completed;
     return processing;
 
   } catch (error) {

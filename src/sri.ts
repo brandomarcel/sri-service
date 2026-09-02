@@ -530,11 +530,10 @@ export type AutResult = {
 export function parseAutorizacion(resp: any): AutResult {
   const raiz = resp?.RespuestaAutorizacionComprobante ?? resp;
 
-  const numeroComprobantes = (raiz?.numeroComprobantes ?? '').toString().trim();
   const autRoot = raiz?.autorizaciones?.autorizacion;
 
   // <-- caso típico de "pendiente / no encontrado aún"
-  if (!autRoot || numeroComprobantes === '0') {
+  if (!autRoot) {
     return {
       estado: 'PENDIENTE',
       autorizado: false,
