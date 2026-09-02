@@ -137,6 +137,7 @@ test('parsea AUTORIZADO y SOAP Fault sin exponer el payload', async () => {
   try {
     const result = await autorizacion(authWsdl, accessKey);
     assert.equal(result.RespuestaAutorizacionComprobante.autorizaciones.autorizacion.estado, 'AUTORIZADO');
+    assert.equal(logs.some((line) => line.includes('environment=test') && line.includes('endpoint=https://celcer.sri.gob.ec/')), true);
     assert.equal(logs.some((line) => line.includes('<factura') || line.includes('password')), false);
   } finally {
     console.info = originalInfo;

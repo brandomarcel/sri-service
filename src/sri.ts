@@ -227,6 +227,13 @@ function wait(ms: number): Promise<void> {
 
 export async function postSoapWithRetry(wsdlUrl: string, envelope: string, operation: SriOperation, accessKey?: string, options: SoapRequestOptions = {}): Promise<SoapHttpResponse> {
   const endpoint = endpointFromWsdl(wsdlUrl);
+  console.info(
+    `[SRI SOAP] ${operation} request ` +
+    `environment=${environmentFromWsdl(wsdlUrl)} ` +
+    `wsdlUrl=${wsdlUrl} ` +
+    `endpoint=${endpoint} ` +
+    `method=${operation === 'recepcion' ? 'validarComprobante' : 'autorizacionComprobante'}`
+  );
   const configuredTimeout = Number(process.env.SRI_TIMEOUT_MS || 90000);
   const timeoutMs = options.timeoutMs ?? (Number.isFinite(configuredTimeout) ? Math.min(Math.max(configuredTimeout, 60000), 120000) : 90000);
   const configuredAttempts = Number(options.maxAttempts ?? process.env.SRI_MAX_ATTEMPTS ?? 3);
