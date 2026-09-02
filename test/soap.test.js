@@ -7,6 +7,7 @@ const {
   SriSoapFaultError,
   SriTransportError,
   autorizacion,
+  autorizacionConPolling,
   buildSoapEnvelope,
   endpointFromWsdl,
   isRecibida,
@@ -149,5 +150,19 @@ test('parsea AUTORIZADO y SOAP Fault sin exponer secretos', async () => {
     await assert.rejects(() => autorizacion(authWsdl, accessKey), (error) => error instanceof SriSoapFaultError && error.code === 'SRI_SOAP_FAULT');
   } finally {
     faultMock.restore();
+  }
+});
+
+test('hace polling de autorización tres veces y devuelve cuando queda AUTORIZADO', async () => {
+  const pending = '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><RespuestaAutorizacionComprobante><numeroComprobantes>0</numeroComprobantes></RespuestaAutorizacionComprobante></soap:Body></soap:Envelope>';
+  const authorized = '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><RespuestaAutorizacionComprobante><numeroComprobantes>1</numeroComprobantes><autorizaciones><autorizacion><estado>AUTORIZADO</estado><numeroAutorizacion>AUTH-2</numeroAutorizacion></autorizacion></autorizaciones></RespuestaAutorizacionComprobante></soap:Body></soap:Envelope>';
+  let attempt = 0;
+  const mock = mockHttps(({ callback }) => callback(soapResponse(attempt++ === 0 ? pending : authorized)));
+  try {
+    const result = await autorizacionConPolling(authWsdl, accessKey, { maxAttempts: 3, intervalMs: 0 });
+    assert.equal(result.RespuestaAutorizacionComprobante.autorizaciones.autorizacion.estado, 'AUTORIZADO');
+    assert.equal(mock.calls.length, 2);
+  } finally {
+    mock.restore();
   }
 });

@@ -1,5 +1,5 @@
 import { EmitInvoiceOutput } from './types';
-import { recepcion, autorizacion, isRecibida, parseAutorizacion, SriTransportError, SriSoapFaultError, SriXmlValidationError } from './sri';
+import { recepcion, autorizacion, autorizacionConPolling, isRecibida, parseAutorizacion, SriTransportError, SriSoapFaultError, SriXmlValidationError } from './sri';
 import * as dotenv from 'dotenv';
 import { generateInvoiceXML, generateCreditNoteXML, signXML, InvoiceVersion, Invoice } from 'open-factura-ec';
 import { createHash } from 'crypto';
@@ -389,6 +389,87 @@ export async function emitirFactura(payload: any): Promise<EmitInvoiceOutput> {
   }
 }
 
+const authorizationJobs = new Map<string, Promise<void>>();
+
+function queueAuthorizationPolling(params: {
+  idempotencyKey: string;
+  authorizationUrl: string;
+  accessKey: string;
+  signedXml: string;
+  payloadHash: string;
+  environment: string;
+}): void {
+  if (authorizationJobs.has(params.idempotencyKey)) return;
+
+  const job = (async () => {
+    try {
+      const auth = await autorizacionConPolling(params.authorizationUrl, params.accessKey, {
+        maxAttempts: 3,
+        intervalMs: 5000
+      });
+      const parsed = parseAutorizacion(auth);
+
+      if (parsed.estado === 'PENDIENTE' || parsed.estado === 'DESCONOCIDO') {
+        const out: CachedResponse = {
+          ok: true,
+          status: 'PROCESSING',
+          code: 'SRI_RECEIVED',
+          accessKey: params.accessKey,
+          xml_signed_base64: Buffer.from(params.signedXml).toString('base64'),
+          messages: [parsed.errorMsg || 'Esperando autorización del SRI.'],
+          payload_hash: params.payloadHash
+        };
+        console.info(
+          `[SRI ASYNC] autorización pendiente ` +
+          `environment=${params.environment} accessKey=${params.accessKey} ` +
+          `status=PROCESSING message=${out.messages?.join(' | ') || 'none'}`
+        );
+        await setCachedResponse(params.idempotencyKey, out, 24 * 60 * 60);
+        return;
+      }
+
+      if (parsed.estado === 'NO AUTORIZADO') {
+        const out: CachedResponse = {
+          ok: false,
+          status: 'NOT_AUTHORIZED',
+          code: 'SRI_REJECTED',
+          accessKey: params.accessKey,
+          xml_signed_base64: Buffer.from(params.signedXml).toString('base64'),
+          messages: [parsed.errorMsg || 'El comprobante no fue autorizado.'],
+          payload_hash: params.payloadHash
+        };
+        await setCachedResponse(params.idempotencyKey, out, 24 * 60 * 60);
+        return;
+      }
+
+      const out: CachedResponse = {
+        ok: true,
+        status: 'AUTHORIZED',
+        code: 'SRI_AUTHORIZED',
+        accessKey: params.accessKey,
+        authorization: { number: parsed.number, date: parsed.date },
+        xml_signed_base64: Buffer.from(params.signedXml).toString('base64'),
+        xml_authorized_base64: parsed.xmlAut ? Buffer.from(parsed.xmlAut).toString('base64') : undefined,
+        messages: [],
+        payload_hash: params.payloadHash
+      };
+      await setCachedResponse(params.idempotencyKey, out, 24 * 60 * 60);
+    } catch (error) {
+      const out = sriErrorResponse(error, params.accessKey, params.payloadHash);
+      await setCachedResponse(params.idempotencyKey, out, 24 * 60 * 60);
+      console.error(
+        `[SRI ASYNC] autorización fallida ` +
+        `environment=${params.environment} accessKey=${params.accessKey} ` +
+        `code=${out.code || 'SRI_CONNECTION_ERROR'}`
+      );
+    }
+  })().finally(() => {
+    authorizationJobs.delete(params.idempotencyKey);
+  });
+
+  authorizationJobs.set(params.idempotencyKey, job);
+}
+
 async function emitirFacturaInternal(payload: any): Promise<EmitInvoiceOutput> {
   const idempotencyKey = payload.idempotency_key || `${payload?.infoTributaria?.ruc}-${payload?.infoTributaria?.estab}-${payload?.infoTributaria?.ptoEmi}-${payload?.infoTributaria?.secuencial}-${payload?.infoFactura?.fechaEmision}`;
   const reqHash = payloadHash(payload);
@@ -443,53 +524,30 @@ const numericCode =
 	
 	
 
-    const auth = await autorizacion(autorizacionUrl, accessKey!);
-    const parsed = parseAutorizacion(auth);
-    if (parsed.estado === 'PENDIENTE' || parsed.estado === 'DESCONOCIDO') {
-      const out: CachedResponse = {
-        ok: true,
-        status: 'PROCESSING',
-        code: 'SRI_RECEIVED',
-        accessKey,
-        xml_signed_base64: Buffer.from(signedXml).toString('base64'),
-        messages: [parsed.errorMsg || 'Esperando autorización del SRI.'],
-        payload_hash: reqHash
-      };
-      console.info(
-        `[SRI SOAP] estado PROCESSING guardado ` +
-        `environment=${env} endpoint=${autorizacionUrl} accessKey=${accessKey} ` +
-        `message=${out.messages?.join(' | ') || 'none'}`
-      );
-      await setCachedResponse(idempotencyKey, out, 24 * 60 * 60);
-      return out;
-    }
-    if (parsed.estado === 'NO AUTORIZADO') {
-      const out: CachedResponse = {
-        ok: false,
-        status: 'NOT_AUTHORIZED',
-        code: 'SRI_REJECTED',
-        accessKey,
-        xml_signed_base64: Buffer.from(signedXml).toString('base64'),
-        messages: [parsed.errorMsg || 'El comprobante no fue autorizado.'],
-        payload_hash: reqHash
-      };
-      await setCachedResponse(idempotencyKey, out, 24 * 60 * 60);
-      return out;
-    }
-
-    const ok: CachedResponse = {
+    const processing: CachedResponse = {
       ok: true,
-      status: 'AUTHORIZED',
-      code: 'SRI_AUTHORIZED',
+      status: 'PROCESSING',
+      code: 'SRI_RECEIVED',
       accessKey,
-      authorization: { number: parsed.number, date: parsed.date },
       xml_signed_base64: Buffer.from(signedXml).toString('base64'),
-      xml_authorized_base64: parsed.xmlAut ? Buffer.from(parsed.xmlAut).toString('base64') : undefined,
-      messages: [],
+      messages: ['El comprobante fue recibido. La autorización se está consultando en segundo plano.'],
       payload_hash: reqHash
     };
-    await setCachedResponse(idempotencyKey, ok, 24 * 60 * 60);
-    return ok;
+    console.info(
+      `[SRI SOAP] estado PROCESSING guardado ` +
+      `environment=${env} endpoint=${autorizacionUrl} accessKey=${accessKey} ` +
+      `message=${processing.messages?.join(' | ') || 'none'}`
+    );
+    await setCachedResponse(idempotencyKey, processing, 24 * 60 * 60);
+    queueAuthorizationPolling({
+      idempotencyKey,
+      authorizationUrl: autorizacionUrl,
+      accessKey: accessKey!,
+      signedXml,
+      payloadHash: reqHash,
+      environment: env
+    });
+    return processing;
 
   } catch (error) {
     if (error instanceof CertificateInputError || error instanceof SriXmlValidationError) throw error;

@@ -84,6 +84,11 @@ export type SoapRequestOptions = {
   backoffMs?: number;
 };
 
+export type SriAuthorizationPollingOptions = {
+  maxAttempts?: number;
+  intervalMs?: number;
+};
+
 const sriAgent = new https.Agent({
   keepAlive: false,
   maxSockets: 10,
@@ -473,6 +478,34 @@ export async function autorizacion(wsdlUrl: string, accessKey: string) {
     }
     throw error;
   }
+}
+
+export async function autorizacionConPolling(
+  wsdlUrl: string,
+  accessKey: string,
+  options: SriAuthorizationPollingOptions = {}
+) {
+  const maxAttempts = Math.min(Math.max(options.maxAttempts ?? 3, 1), 3);
+  const intervalMs = Math.max(options.intervalMs ?? 5000, 0);
+  let lastResponse: any;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const startedAt = Date.now();
+    lastResponse = await autorizacion(wsdlUrl, accessKey);
+    const parsed = parseAutorizacion(lastResponse);
+    console.info(
+      `[SRI POLLING] accessKey=${accessKey} attempt=${attempt} ` +
+      `estado=${parsed.estado} durationMs=${Date.now() - startedAt}`
+    );
+
+    if (parsed.estado === 'AUTORIZADO' || parsed.estado === 'NO AUTORIZADO' || attempt >= maxAttempts) {
+      return lastResponse;
+    }
+
+    await wait(intervalMs);
+  }
+
+  return lastResponse;
 }
 
 export function isRecibida(resp: any): boolean {
