@@ -7,6 +7,9 @@ import { createClient } from 'redis';
 import * as fs from 'fs';
 import * as http from 'http';
 import * as https from 'https';
+import { spawn } from 'child_process';
+import * as os from 'os';
+import * as path from 'path';
 import { getSriUrls } from './sri-config';
 
 dotenv.config();
@@ -34,10 +37,11 @@ let redisConnected = false;
 })();
 type CachedResponse = EmitInvoiceOutput & { payload_hash?: string };
 const memoryStore = new Map<string, { response: CachedResponse, timestamp: number }>();
-setInterval(() => {
+const cacheCleanupTimer = setInterval(() => {
   const now = Date.now();
   for (const [k,v] of memoryStore.entries()) if (now - v.timestamp > 24*60*60*1000) memoryStore.delete(k);
 }, 60*60*1000);
+cacheCleanupTimer.unref();
 
 function stableStringify(obj: any): string {
   const all = new Set<string>(); JSON.stringify(obj, (k,v)=> (all.add(k), v));
@@ -75,23 +79,237 @@ async function fetchAsBase64(url: string): Promise<string> {
   });
 }
 async function readCertificateFile(filePath: string) {
-  const buf = await fs.promises.readFile(filePath);
-  return buf.toString('base64');
+  return fs.promises.readFile(filePath);
 }
-async function readCertificateFromInput(input: {
+
+export class CertificateInputError extends Error {
+  readonly statusCode = 400;
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'CertificateInputError';
+  }
+}
+
+function publicErrorMessage(error: unknown, fallback: string): string {
+  const message = error instanceof Error ? error.message : '';
+  // Nunca devolver rutas temporales, detalles PKCS#12 ni mensajes que puedan
+  // incluir material sensible de la librería de firma.
+  if (/p12|pkcs|certificate|certificado|private key|password|contraseña|sri-p12-|\/tmp\//i.test(message)) {
+    return fallback;
+  }
+  return message || fallback;
+}
+
+type CertificateInput = {
   p12_base64?: string;
   p12_url?: string;
   p12_path?: string;
   urlFirma?: string;
-}) {
-  const url = input.p12_url || input.urlFirma;
-  if (input.p12_base64 && !input.p12_base64.startsWith('http') && !input.p12_base64.startsWith('/') && !input.p12_base64.includes('\\')) {
-    return input.p12_base64;
+};
+
+function certificateAllowedDirectories(): string[] {
+  const configured = process.env.SRI_CERTIFICATE_ALLOWED_DIR || process.env.SRI_CERTIFICATES_DIR;
+  return configured
+    ? configured.split(path.delimiter).filter(Boolean).map((dir) => path.resolve(dir))
+    : [];
+}
+
+function isPathInside(childPath: string, parentPath: string): boolean {
+  const relative = path.relative(parentPath, childPath);
+  return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+async function readControlledCertificateFile(filePath: string): Promise<Buffer> {
+  if (!(filePath.startsWith('/') || filePath.startsWith('./'))) {
+    throw new CertificateInputError('La ruta heredada del certificado no tiene un formato permitido.');
   }
-  if (url) return await fetchAsBase64(url);
-  const path = input.p12_path || input.p12_base64;
-  if (path && (path.startsWith('/') || path.includes('\\'))) return await readCertificateFile(path);
-  throw new Error('No se proporcionó certificado (p12_base64|p12_url|p12_path|urlFirma).');
+
+  const allowedDirectories = certificateAllowedDirectories();
+  if (!allowedDirectories.length) {
+    throw new CertificateInputError('La carpeta permitida para certificados no está configurada.');
+  }
+
+  try {
+    const resolvedPath = path.resolve(process.cwd(), filePath);
+    const realPath = await fs.promises.realpath(resolvedPath);
+    const realAllowedDirectories = await Promise.all(
+      allowedDirectories.map(async (directory) => {
+        try { return await fs.promises.realpath(directory); } catch { return null; }
+      })
+    );
+
+    if (!realAllowedDirectories.some((directory) => directory && isPathInside(realPath, directory))) {
+      throw new CertificateInputError('La ruta del certificado está fuera de la carpeta permitida.');
+    }
+
+    const stat = await fs.promises.stat(realPath);
+    if (!stat.isFile()) throw new CertificateInputError('El certificado indicado no es un archivo.');
+    return await readCertificateFile(realPath);
+  } catch (error) {
+    if (error instanceof CertificateInputError) throw error;
+    throw new CertificateInputError('No se encontró el archivo del certificado.');
+  }
+}
+
+function extractBase64Payload(value: string): string {
+  const trimmed = value.trim();
+  const dataUri = /^data:[^,]*;base64,(.*)$/is.exec(trimmed);
+  return (dataUri ? dataUri[1] : trimmed).replace(/\s+/g, '');
+}
+
+function isValidBase64(value: string): boolean {
+  if (!value || value.length % 4 === 1 || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) return false;
+  const paddingIndex = value.indexOf('=');
+  if (paddingIndex !== -1 && paddingIndex < value.length - 2) return false;
+  const unpadded = value.replace(/=+$/, '');
+  const decoded = Buffer.from(value, 'base64');
+  if (!decoded.length) return false;
+  return decoded.toString('base64').replace(/=+$/, '') === unpadded;
+}
+
+function decodeCertificateBase64(value: string): Buffer {
+  const cleanBase64 = extractBase64Payload(value);
+  if (!cleanBase64) throw new CertificateInputError('El Base64 del certificado está vacío.');
+  if (!isValidBase64(cleanBase64)) throw new CertificateInputError('El Base64 del certificado no es válido.');
+
+  const p12Buffer = Buffer.from(cleanBase64, 'base64');
+  if (!p12Buffer.length) throw new CertificateInputError('El Buffer del certificado está vacío.');
+  return p12Buffer;
+}
+
+async function readCertificateFromInput(input: CertificateInput): Promise<Buffer> {
+  // Base64 real siempre tiene prioridad sobre las rutas heredadas.
+  if (input.p12_base64 !== undefined) {
+    const cleanBase64 = extractBase64Payload(input.p12_base64);
+    const trimmed = input.p12_base64.trim();
+    const isDataUri = /^data:/i.test(trimmed);
+    if (isDataUri || isValidBase64(cleanBase64) || !(trimmed.startsWith('/') || trimmed.startsWith('./'))) {
+      return decodeCertificateBase64(input.p12_base64);
+    }
+    return readControlledCertificateFile(trimmed);
+  }
+
+  const url = input.p12_url || input.urlFirma;
+  if (url) return decodeCertificateBase64(await fetchAsBase64(url));
+  if (input.p12_path !== undefined) {
+    const trimmedPath = input.p12_path.trim();
+    if (!trimmedPath) throw new CertificateInputError('No se proporcionó certificado (p12_base64 o p12_path).');
+    return readControlledCertificateFile(trimmedPath);
+  }
+  throw new CertificateInputError('No se proporcionó certificado (p12_base64 o p12_path).');
+}
+
+// Exportadas para pruebas de integración y para mantener una única ruta de
+// validación en cualquier consumidor interno del servicio.
+export const resolveCertificateBuffer = readCertificateFromInput;
+
+type OpenSslResult = { code: number | null; stdout: string; stderr: string };
+
+function runOpenSsl(args: string[], input: string | Buffer): Promise<OpenSslResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('openssl', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    child.stdout.on('data', (chunk) => stdout.push(Buffer.from(chunk)));
+    child.stderr.on('data', (chunk) => stderr.push(Buffer.from(chunk)));
+    child.on('error', reject);
+    child.on('close', (code) => resolve({
+      code,
+      stdout: Buffer.concat(stdout).toString('utf8'),
+      stderr: Buffer.concat(stderr).toString('utf8')
+    }));
+    child.stdin.end(input);
+  });
+}
+
+async function validateP12File(filePath: string, password: string): Promise<void> {
+  let result: OpenSslResult;
+  try {
+    result = await runOpenSsl(['pkcs12', '-in', filePath, '-passin', 'stdin', '-nodes'], password);
+  } catch {
+    throw new CertificateInputError('No se pudo validar el certificado P12.');
+  }
+
+  // OpenSSL 3 requiere -legacy para algunos P12 antiguos.
+  if (result.code !== 0 && /unsupported|legacy|inner_evp_generic_fetch/i.test(result.stderr)) {
+    try {
+      result = await runOpenSsl(['pkcs12', '-legacy', '-in', filePath, '-passin', 'stdin', '-nodes'], password);
+    } catch {
+      throw new CertificateInputError('No se pudo validar el certificado P12.');
+    }
+  }
+
+  if (result.code !== 0) {
+    if (/mac verify|invalid password|bad decrypt|pkcs12 cipherfinal/i.test(result.stderr)) {
+      throw new CertificateInputError('La contraseña del certificado es incorrecta.');
+    }
+    throw new CertificateInputError('El archivo no es un certificado P12 válido.');
+  }
+
+  const certificate = /-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/.exec(result.stdout)?.[0];
+  if (!certificate) throw new CertificateInputError('El P12 no contiene un certificado digital.');
+  if (!/-----BEGIN (?:PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY)-----/.test(result.stdout)) {
+    throw new CertificateInputError('El P12 no contiene una clave privada.');
+  }
+
+  const dates = await runOpenSsl(['x509', '-noout', '-startdate', '-enddate'], certificate);
+  if (dates.code !== 0) throw new CertificateInputError('No se pudo leer la vigencia del certificado.');
+  const notBefore = /^notBefore=(.+)$/im.exec(dates.stdout)?.[1];
+  const notAfter = /^notAfter=(.+)$/im.exec(dates.stdout)?.[1];
+  const start = notBefore ? Date.parse(notBefore) : NaN;
+  const end = notAfter ? Date.parse(notAfter) : NaN;
+  const now = Date.now();
+  if (!Number.isFinite(start) || !Number.isFinite(end)) {
+    throw new CertificateInputError('No se pudo leer la vigencia del certificado.');
+  }
+  if (now < start) throw new CertificateInputError('El certificado todavía no está vigente.');
+  if (now > end) throw new CertificateInputError('El certificado está vencido.');
+}
+
+async function withTemporaryCertificate<T>(p12Buffer: Buffer, password: string, callback: (filePath: string) => Promise<T>): Promise<T> {
+  const tempDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'sri-p12-'));
+  const tempPath = path.join(tempDirectory, 'certificate.p12');
+  try {
+    await fs.promises.writeFile(tempPath, p12Buffer, { mode: 0o600 });
+    await fs.promises.chmod(tempPath, 0o600);
+    await validateP12File(tempPath, password);
+    return await callback(tempPath);
+  } finally {
+    await fs.promises.rm(tempPath, { force: true }).catch(() => undefined);
+    await fs.promises.rm(tempDirectory, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+export async function validateCertificateBuffer(p12Buffer: Buffer, password: string): Promise<void> {
+  if (!p12Buffer.length) throw new CertificateInputError('El Buffer del certificado está vacío.');
+  if (!password) throw new CertificateInputError('Falta la contraseña del certificado.');
+  await withTemporaryCertificate(p12Buffer, password, async () => undefined);
+}
+
+// open-factura-ec todavía emite objetos de clave privada por console.log durante
+// la firma. Se serializa esta sección para impedir que ese debug filtre secretos.
+let signingTail = Promise.resolve();
+async function signXmlWithCertificate(xml: string, input: CertificateInput, password: string): Promise<string> {
+  const p12Buffer = await readCertificateFromInput(input);
+  if (!p12Buffer.length) throw new CertificateInputError('El Buffer del certificado está vacío.');
+  if (!password) throw new CertificateInputError('Falta la contraseña del certificado.');
+
+  let release!: () => void;
+  const previous = signingTail;
+  signingTail = new Promise<void>((resolve) => { release = resolve; });
+  await previous;
+  const originalLog = console.log;
+  console.log = (...args: any[]) => {
+    if (typeof args[0] === 'string' && /DEBUG (?:typeof )?privateKeyObj/i.test(args[0])) return;
+    originalLog(...args);
+  };
+  try {
+    return await withTemporaryCertificate(p12Buffer, password, (tempPath) => signXML(xml, tempPath, password));
+  } finally {
+    console.log = originalLog;
+    release();
+  }
 }
 
 function parseRecepcionMensajes(resp: any): string[] {
@@ -128,22 +346,13 @@ export async function emitirFactura(payload: any): Promise<EmitInvoiceOutput> {
   const { recepcion: recepcionUrl, autorizacion: autorizacionUrl } = getSriUrls(env);
 
   const cached = await getCachedResponse(idempotencyKey);
-  if (cached && cached.payload_hash === reqHash){ 
-  
-  console.log('cache',cached)
-  return cached;}
+  if (cached && cached.payload_hash === reqHash) return cached;
 
   const { version = DEFAULT_VERSION, infoTributaria, infoFactura, detalles, infoAdicional, certificate } = payload;
   if (!infoTributaria || !infoFactura || !detalles || !certificate) {
-    const e = { status: 'ERROR' as const, messages: ['Datos incompletos en el payload'], payload_hash: reqHash };
-    await setCachedResponse(idempotencyKey, e, 3600); return e;
+    throw new CertificateInputError('Datos incompletos en el payload.');
   }
-
-  let p12Base64 = await readCertificateFromInput({
-    p12_base64: certificate.p12_base64,
-    p12_url: (certificate as any).p12_url,
-    p12_path: (certificate as any).p12_path
-  });
+  if (!certificate.password) throw new CertificateInputError('Falta la contraseña del certificado.');
 
 const numericCode =
   typeof payload.numeric_code === 'string' && /^\d{8}$/.test(payload.numeric_code)
@@ -154,16 +363,15 @@ const numericCode =
 
   try {
     const { xml, accessKey } = generateInvoiceXML(sriInvoice, numericCode);
-    const signedXml = await signXML(xml, certificate.p12_base64, certificate.password);
+    const signedXml = await signXmlWithCertificate(xml, {
+      p12_base64: certificate.p12_base64,
+      p12_url: certificate.p12_url,
+      p12_path: certificate.p12_path
+    }, certificate.password);
 
     const rec = await recepcion(recepcionUrl, signedXml);
-	 console.log('recepcion',rec)
-	 console.log('isRecibida',isRecibida(rec))
-	 
     if (!isRecibida(rec)) {
-	
       const msgs = parseRecepcionMensajes(rec);
-	   console.log('no fue recibida',msgs)
       // ⛔ Opción B: NO cachear estados transitorios
       return {
         status: 'ERROR',
@@ -178,7 +386,6 @@ const numericCode =
 
     const auth = await autorizacion(autorizacionUrl, accessKey);
     const parsed = parseAutorizacion(auth);
- console.log('autorizacion',auth)
     if (parsed.estado === 'PENDIENTE' || parsed.estado === 'DESCONOCIDO') {
       // ⛔ Opción B: NO cachear PROCESSING
       return {
@@ -214,8 +421,8 @@ const numericCode =
     return ok;
 
   } catch (error) {
-    const msg = error instanceof Error ? error.message : 'Error desconocido';
-    return { status: 'ERROR', messages: [msg] };
+    if (error instanceof CertificateInputError) throw error;
+    return { status: 'ERROR', messages: [publicErrorMessage(error, 'No se pudo firmar o emitir la factura.')] };
   }
 }
 
@@ -245,16 +452,15 @@ export async function emitirFacturaDesdeXML(payload: {
   if (cached && cached.payload_hash === reqHash) return cached;
 
   const password = payload.certificate?.password || payload.clave;
-  if (!password) return { status: 'ERROR', messages: ['Falta la contraseña del certificado (password/clave).'] };
-
-  const p12Base64 = await readCertificateFromInput({
-    p12_base64: payload.certificate?.p12_base64,
-    p12_url: payload.certificate?.p12_url || payload.urlFirma,
-    p12_path: payload.certificate?.p12_path
-  });
+  if (!password) throw new CertificateInputError('Falta la contraseña del certificado (password/clave).');
 
   try {
-    const signedXml = await signXML(xml, p12Base64, password);
+    const signedXml = await signXmlWithCertificate(xml, {
+      p12_base64: payload.certificate?.p12_base64,
+      p12_url: payload.certificate?.p12_url,
+      p12_path: payload.certificate?.p12_path,
+      urlFirma: payload.urlFirma
+    }, password);
 
     const rec = await recepcion(recepcionUrl, signedXml);
     if (!isRecibida(rec)) {
@@ -307,8 +513,8 @@ export async function emitirFacturaDesdeXML(payload: {
     return ok;
 
   } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Error desconocido';
-    return { status: 'ERROR', messages: [msg] };
+    if (err instanceof CertificateInputError) throw err;
+    return { status: 'ERROR', messages: [publicErrorMessage(err, 'No se pudo firmar o emitir el XML.')] };
   }
 }
 
@@ -323,20 +529,13 @@ export async function emitirNotaCredito(payload: any): Promise<EmitInvoiceOutput
   const { recepcion: recepcionUrl, autorizacion: autorizacionUrl } = getSriUrls(env);
 
   const cached = await getCachedResponse(idempotencyKey);
-  console.log('cached nota credito', cached);
   if (cached && cached.payload_hash === reqHash) return cached;
 
   const { infoTributaria, infoNotaCredito, detalles, infoAdicional, certificate } = payload;
   if (!infoTributaria || !infoNotaCredito || !detalles || !certificate) {
-    const e = { status: 'ERROR' as const, messages: ['Datos incompletos para nota de crédito'], payload_hash: reqHash };
-    await setCachedResponse(idempotencyKey, e, 3600); return e;
+    throw new CertificateInputError('Datos incompletos para nota de crédito.');
   }
-
-  const p12Base64 = await readCertificateFromInput({
-    p12_base64: certificate.p12_base64,
-    p12_url: (certificate as any).p12_url,
-    p12_path: (certificate as any).p12_path
-  });
+  if (!certificate.password) throw new CertificateInputError('Falta la contraseña del certificado.');
 
   try {
 const numericCode =
@@ -350,7 +549,11 @@ const numericCode =
       numericCode
     );
 
-    const signedXml = await signXML(xml, certificate.p12_base64, certificate.password);
+    const signedXml = await signXmlWithCertificate(xml, {
+      p12_base64: certificate.p12_base64,
+      p12_url: certificate.p12_url,
+      p12_path: certificate.p12_path
+    }, certificate.password);
 
     const rec = await recepcion(recepcionUrl, signedXml);
     if (!isRecibida(rec)) {
@@ -403,8 +606,8 @@ const numericCode =
     return ok;
 
   } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Error desconocido';
-    return { status: 'ERROR', messages: [msg] };
+    if (err instanceof CertificateInputError) throw err;
+    return { status: 'ERROR', messages: [publicErrorMessage(err, 'No se pudo firmar o emitir la nota de crédito.')] };
   }
 }
 

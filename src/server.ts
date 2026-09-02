@@ -26,17 +26,28 @@ import { getSriUrls } from './sri-config';
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
+const certificateSchema = z.object({
+  // p12_base64 es el contrato actual; p12_path queda solo para compatibilidad.
+  p12_base64: z.string().optional(),
+  p12_path: z.string().optional(),
+  password: z.string().optional()
+}).passthrough().superRefine((certificate, context) => {
+  if (!certificate.p12_base64 && !certificate.p12_path) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['p12_base64'], message: 'Falta p12_base64 o p12_path.' });
+  }
+  if (!certificate.password) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['password'], message: 'Falta la contraseña del certificado.' });
+  }
+});
+
 // --- Schema Zod para FACTURA (JSON canónico) ---
-const invoiceSchema = z.object({
+export const invoiceSchema = z.object({
   idempotency_key: z.string().min(6).optional(),
   env: z.enum(['test','prod']).optional(),
   numeric_code: z.string().regex(/^\d{8}$/).optional(),
 
   version: z.string().optional().default('2.1.0'),
-  certificate: z.object({
-    p12_base64: z.string().min(1),
-    password: z.string().min(1)
-  }).passthrough(),
+  certificate: certificateSchema,
 
   infoTributaria: z.any(),
   infoFactura: z.any(),
@@ -45,7 +56,7 @@ const invoiceSchema = z.object({
 });
 
 // --- Schema para el formato legacy ---
-const legacySchema = z.object({
+export const legacySchema = z.object({
   idempotency_key: z.string().min(6),
   env: z.enum(['test','prod']),
   numeric_code: z.string().regex(/^\d{8}$/).optional(),
@@ -62,10 +73,7 @@ const legacySchema = z.object({
     contribuyenteRimpe: z.string().optional(),
     obligadoContabilidad: z.string().optional(),
   }),
-  certificate: z.object({
-    p12_base64: z.string().min(1),
-    password: z.string().min(1)
-  }),
+  certificate: certificateSchema,
   invoice: z.object({
     issueDate: z.string(),
     buyer: z.object({
@@ -239,8 +247,10 @@ function getSriConfig(env: 'test' | 'prod') {
 // Emitir FACTURA (JSON canónico)
 app.post('/api/v1/invoices/emit', async (req, res) => {
   try {
+    if (!req.body?.certificate) {
+      return res.status(400).json({ status: 'ERROR', messages: ['Falta el campo certificate.'] });
+    }
     const newFormatParse = invoiceSchema.safeParse(req.body);
-	console.log('Received payload:', newFormatParse);
     if (newFormatParse.success) {
       const out = await emitirFactura(newFormatParse.data);
       return res.json(out);
@@ -257,10 +267,18 @@ app.post('/api/v1/invoices/emit', async (req, res) => {
       ...(newFormatParse.error?.errors ?? []),
       ...(legacyFormatParse.error?.errors ?? []),
     ];
-    return res.status(400).json({ status: 'ERROR', message: 'Formato de datos inválido', issues: errors });
+    return res.status(400).json({
+      status: 'ERROR',
+      message: 'Formato de datos inválido',
+      messages: errors.map((error) => error.message),
+      issues: errors
+    });
   } catch (e: any) {
-    console.error('Error al emitir factura:', e);
-    return res.status(500).json({ status: 'ERROR', message: e?.message || 'Internal Error' });
+    if (e?.statusCode === 400) {
+      return res.status(400).json({ status: 'ERROR', messages: [e.message] });
+    }
+    console.error('Error al emitir factura.');
+    return res.status(500).json({ status: 'ERROR', message: 'Internal Error' });
   }
 });
 
@@ -277,8 +295,11 @@ app.post('/api/v1/invoices/emit-xml', async (req, res) => {
     });
     return res.json(out);
   } catch (e: any) {
-    console.error('Error en /emit-xml:', e);
-    return res.status(500).json({ status: 'ERROR', message: e?.message || 'Internal Error' });
+    if (e?.statusCode === 400) {
+      return res.status(400).json({ status: 'ERROR', messages: [e.message] });
+    }
+    console.error('Error en /emit-xml.');
+    return res.status(500).json({ status: 'ERROR', message: 'Internal Error' });
   }
 });
 
@@ -288,15 +309,17 @@ app.post('/api/v1/credit-notes/emit', async (req, res) => {
   
   
     const parsed = creditNoteSchema.safeParse(req.body);
-	console.log('Received payload nota de crédito:', parsed);
     if (!parsed.success) {
       return res.status(400).json({ status: 'ERROR', message: 'Formato de datos inválido', issues: parsed.error.errors });
     }
     const out = await emitirNotaCredito(parsed.data);
     return res.json(out);
   } catch (e: any) {
-    console.error('Error al emitir nota de crédito:', e);
-    return res.status(500).json({ status: 'ERROR', message: e?.message || 'Internal Error' });
+    if (e?.statusCode === 400) {
+      return res.status(400).json({ status: 'ERROR', messages: [e.message] });
+    }
+    console.error('Error al emitir nota de crédito.');
+    return res.status(500).json({ status: 'ERROR', message: 'Internal Error' });
   }
 });
 
@@ -425,5 +448,9 @@ app.get('/health', (req, res) => {
   });
 });
 
-const port = Number(process.env.PORT || 8090);
-app.listen(port, () => console.log(`🚀 Servicio SRI escuchando en el puerto :${port}`));
+export { app };
+
+if (require.main === module) {
+  const port = Number(process.env.PORT || 8090);
+  app.listen(port, () => console.log(`🚀 Servicio SRI escuchando en el puerto :${port}`));
+}

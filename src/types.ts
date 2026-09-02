@@ -35,7 +35,7 @@ export interface EmitInvoiceInput {
     contribuyenteRimpe?: string;
     obligadoContabilidad?: 'SI'|'NO';  // Campo añadido
   };
-  certificate: { p12_base64: string; password: string };
+  certificate: ({ p12_base64: string } | { p12_path: string }) & { password: string };
   invoice: {
     issueDate: string;
     buyer: {

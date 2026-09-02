@@ -76,7 +76,6 @@ export type AutResult = {
 };
 
 export function parseAutorizacion(resp: any): AutResult {
-  try { console.log('SRI raw:', JSON.stringify(resp)); } catch {}
   const raiz = resp?.RespuestaAutorizacionComprobante ?? resp;
 
   const numeroComprobantes = (raiz?.numeroComprobantes ?? '').toString().trim();
