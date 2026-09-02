@@ -142,6 +142,12 @@ function logSoap(operation: SriOperation, wsdlUrl: string, accessKey: string | u
   console.info(`[SRI SOAP] ${operation} ${details.code ? 'failed' : 'completed'} ${fields.join(' ')}`);
 }
 
+function redactDebugXml(xml: string): string {
+  return xml
+    .replace(/(<(?:[\w.-]+:)?X509Certificate\b[^>]*>)[\s\S]*?(<\/(?:[\w.-]+:)?X509Certificate>)/gi, '$1[REDACTED_CERTIFICATE]$2')
+    .replace(/(<(?:[\w.-]+:)?(?:privateKey|PrivateKey|password|contraseña|p12_base64)\b[^>]*>)[\s\S]*?(<\/(?:[\w.-]+:)?(?:privateKey|PrivateKey|password|contraseña|p12_base64)>)/gi, '$1[REDACTED_SECRET]$2');
+}
+
 function escapeXml(value: string): string {
   return value.replace(/[<>&'\"]/g, (character) => ({
     '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '\"': '&quot;'
@@ -208,7 +214,14 @@ function postSoapOnce(endpoint: string, envelope: string, operation: SriOperatio
           reject(new SriSoapFaultError('La respuesta SOAP del SRI excede el tamaño permitido.', statusCode));
           return;
         }
-        resolve({ body: Buffer.concat(chunks).toString('utf8'), statusCode, attempts: 1, durationMs });
+        const responseBody = Buffer.concat(chunks).toString('utf8');
+        console.info(
+          `[SRI SOAP] ${operation} response ` +
+          `accessKey=${maskAccessKey(accessKey)} attempt=${attempt} ` +
+          `statusHttp=${statusCode} durationMs=${durationMs}\n` +
+          redactDebugXml(responseBody)
+        );
+        resolve({ body: responseBody, statusCode, attempts: 1, durationMs });
       });
     });
 
@@ -250,7 +263,13 @@ export async function postSoapWithRetry(wsdlUrl: string, envelope: string, opera
       if (!(error instanceof SriTransportError)) throw error;
       lastError = new SriTransportError(error.code, error.message, attempt);
       if (attempt >= maxAttempts) throw lastError;
-      await wait(backoffMs * Math.pow(2, attempt - 1));
+      const waitMs = backoffMs * Math.pow(2, attempt - 1);
+      console.info(
+        `[SRI SOAP] ${operation} retry ` +
+        `accessKey=${maskAccessKey(accessKey)} failedAttempt=${attempt} ` +
+        `nextAttempt=${attempt + 1} waitMs=${waitMs} code=${error.code}`
+      );
+      await wait(waitMs);
     }
   }
   throw lastError || new SriTransportError('SRI_CONNECTION_ERROR', transportMessage('SRI_CONNECTION_ERROR'), maxAttempts);
@@ -403,10 +422,23 @@ function parseAutorizacionResponse(body: string, statusCode: number): any {
 export async function recepcion(wsdlUrl: string, xmlSigned: string) {
   const accessKey = /<\s*claveAcceso\s*>\s*(\d{49})\s*<\s*\/\s*claveAcceso\s*>/i.exec(xmlSigned)?.[1];
   validateSignedInvoiceXml(xmlSigned, environmentFromWsdl(wsdlUrl));
+  console.info(
+    `[SRI SOAP] recepcion XML enviado ` +
+    `environment=${environmentFromWsdl(wsdlUrl)} ` +
+    `endpoint=${endpointFromWsdl(wsdlUrl)} accessKey=${accessKey || 'unknown'}\n` +
+    redactDebugXml(xmlSigned)
+  );
   const xmlB64 = Buffer.from(xmlSigned, 'utf8').toString('base64');
   const response = await postSoapWithRetry(wsdlUrl, soapEnvelope('recepcion', xmlB64), 'recepcion', accessKey);
   try {
-    return parseRecepcionResponse(response.body, response.statusCode);
+    const parsed = parseRecepcionResponse(response.body, response.statusCode);
+    const root = parsed?.RespuestaRecepcionComprobante;
+    const messages = root?.comprobantes?.comprobante?.mensajes?.mensaje || [];
+    console.info(
+      `[SRI SOAP] recepcion estado=${root?.estado || 'DESCONOCIDO'} ` +
+      `accessKey=${accessKey || 'unknown'} mensajes=${JSON.stringify(messages)}`
+    );
+    return parsed;
   } catch (error) {
     if (error instanceof SriSoapFaultError) {
       logSoap('recepcion', wsdlUrl, accessKey, { attempt: response.attempts, durationMs: response.durationMs, statusCode: response.statusCode, code: error.code });
@@ -416,9 +448,25 @@ export async function recepcion(wsdlUrl: string, xmlSigned: string) {
 }
 
 export async function autorizacion(wsdlUrl: string, accessKey: string) {
+  console.info(
+    `[SRI SOAP] autorizacion consulta ` +
+    `environment=${environmentFromWsdl(wsdlUrl)} ` +
+    `endpoint=${endpointFromWsdl(wsdlUrl)} accessKey=${accessKey}`
+  );
   const response = await postSoapWithRetry(wsdlUrl, soapEnvelope('autorizacion', accessKey), 'autorizacion', accessKey);
   try {
-    return parseAutorizacionResponse(response.body, response.statusCode);
+    const parsed = parseAutorizacionResponse(response.body, response.statusCode);
+    const authorization = parsed?.RespuestaAutorizacionComprobante?.autorizaciones?.autorizacion;
+    const first = Array.isArray(authorization) ? authorization[0] : authorization;
+    console.info(
+      `[SRI SOAP] autorizacion resultado ` +
+      `environment=${environmentFromWsdl(wsdlUrl)} accessKey=${accessKey} ` +
+      `attempts=${response.attempts} estado=${first?.estado || 'PENDIENTE'} ` +
+      `numeroAutorizacion=${first?.numeroAutorizacion || 'none'} ` +
+      `fechaAutorizacion=${first?.fechaAutorizacion || 'none'} ` +
+      `mensaje=${first?.mensajes?.mensaje ? JSON.stringify(first.mensajes.mensaje) : 'none'}`
+    );
+    return parsed;
   } catch (error) {
     if (error instanceof SriSoapFaultError) {
       logSoap('autorizacion', wsdlUrl, accessKey, { attempt: response.attempts, durationMs: response.durationMs, statusCode: response.statusCode, code: error.code });

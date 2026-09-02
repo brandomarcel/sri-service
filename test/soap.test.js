@@ -128,8 +128,8 @@ test('parsea rechazo tributario como respuesta válida sin reintentar', async ()
   }
 });
 
-test('parsea AUTORIZADO y SOAP Fault sin exponer el payload', async () => {
-  const authorized = '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><RespuestaAutorizacionComprobante><numeroComprobantes>1</numeroComprobantes><autorizaciones><autorizacion><estado>AUTORIZADO</estado><numeroAutorizacion>AUTH-1</numeroAutorizacion><fechaAutorizacion>2026-09-02</fechaAutorizacion><comprobante><![CDATA[<factura/>]]></comprobante></autorizacion></autorizaciones></RespuestaAutorizacionComprobante></soap:Body></soap:Envelope>';
+test('parsea AUTORIZADO y SOAP Fault sin exponer secretos', async () => {
+  const authorized = '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><RespuestaAutorizacionComprobante><numeroComprobantes>1</numeroComprobantes><autorizaciones><autorizacion><estado>AUTORIZADO</estado><numeroAutorizacion>AUTH-1</numeroAutorizacion><fechaAutorizacion>2026-09-02</fechaAutorizacion><comprobante><![CDATA[<factura><ds:X509Certificate xmlns:ds="http://www.w3.org/2000/09/xmldsig#">secret-cert</ds:X509Certificate></factura>]]></comprobante></autorizacion></autorizaciones></RespuestaAutorizacionComprobante></soap:Body></soap:Envelope>';
   const mock = mockHttps(({ callback }) => callback(soapResponse(authorized)));
   const logs = [];
   const originalInfo = console.info;
@@ -138,7 +138,7 @@ test('parsea AUTORIZADO y SOAP Fault sin exponer el payload', async () => {
     const result = await autorizacion(authWsdl, accessKey);
     assert.equal(result.RespuestaAutorizacionComprobante.autorizaciones.autorizacion.estado, 'AUTORIZADO');
     assert.equal(logs.some((line) => line.includes('environment=test') && line.includes('endpoint=https://celcer.sri.gob.ec/')), true);
-    assert.equal(logs.some((line) => line.includes('<factura') || line.includes('password')), false);
+    assert.equal(logs.some((line) => line.includes('password') || line.includes('PRIVATE KEY') || line.includes('secret-cert')), false);
   } finally {
     console.info = originalInfo;
     mock.restore();

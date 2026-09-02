@@ -455,6 +455,11 @@ const numericCode =
         messages: [parsed.errorMsg || 'Esperando autorización del SRI.'],
         payload_hash: reqHash
       };
+      console.info(
+        `[SRI SOAP] estado PROCESSING guardado ` +
+        `environment=${env} endpoint=${autorizacionUrl} accessKey=${accessKey} ` +
+        `message=${out.messages?.join(' | ') || 'none'}`
+      );
       await setCachedResponse(idempotencyKey, out, 24 * 60 * 60);
       return out;
     }
