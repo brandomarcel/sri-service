@@ -248,7 +248,7 @@ function getSriConfig(env: 'test' | 'prod') {
 app.post('/api/v1/invoices/emit', async (req, res) => {
   try {
     if (!req.body?.certificate) {
-      return res.status(400).json({ status: 'ERROR', messages: ['Falta el campo certificate.'] });
+      return res.status(400).json({ ok: false, status: 'ERROR', code: 'VALIDATION_ERROR', messages: ['Falta el campo certificate.'] });
     }
     const newFormatParse = invoiceSchema.safeParse(req.body);
     if (newFormatParse.success) {
@@ -268,17 +268,19 @@ app.post('/api/v1/invoices/emit', async (req, res) => {
       ...(legacyFormatParse.error?.errors ?? []),
     ];
     return res.status(400).json({
+      ok: false,
       status: 'ERROR',
+      code: 'VALIDATION_ERROR',
       message: 'Formato de datos inválido',
       messages: errors.map((error) => error.message),
       issues: errors
     });
   } catch (e: any) {
     if (e?.statusCode === 400) {
-      return res.status(400).json({ status: 'ERROR', messages: [e.message] });
+      return res.status(400).json({ ok: false, status: 'ERROR', code: 'VALIDATION_ERROR', messages: [e.message] });
     }
     console.error('Error al emitir factura.');
-    return res.status(500).json({ status: 'ERROR', message: 'Internal Error' });
+    return res.status(500).json({ ok: false, status: 'ERROR', code: 'INTERNAL_ERROR', message: 'Internal Error' });
   }
 });
 
@@ -296,10 +298,10 @@ app.post('/api/v1/invoices/emit-xml', async (req, res) => {
     return res.json(out);
   } catch (e: any) {
     if (e?.statusCode === 400) {
-      return res.status(400).json({ status: 'ERROR', messages: [e.message] });
+      return res.status(400).json({ ok: false, status: 'ERROR', code: 'VALIDATION_ERROR', messages: [e.message] });
     }
     console.error('Error en /emit-xml.');
-    return res.status(500).json({ status: 'ERROR', message: 'Internal Error' });
+    return res.status(500).json({ ok: false, status: 'ERROR', code: 'INTERNAL_ERROR', message: 'Internal Error' });
   }
 });
 
@@ -310,16 +312,16 @@ app.post('/api/v1/credit-notes/emit', async (req, res) => {
   
     const parsed = creditNoteSchema.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({ status: 'ERROR', message: 'Formato de datos inválido', issues: parsed.error.errors });
+      return res.status(400).json({ ok: false, status: 'ERROR', code: 'VALIDATION_ERROR', message: 'Formato de datos inválido', issues: parsed.error.errors });
     }
     const out = await emitirNotaCredito(parsed.data);
     return res.json(out);
   } catch (e: any) {
     if (e?.statusCode === 400) {
-      return res.status(400).json({ status: 'ERROR', messages: [e.message] });
+      return res.status(400).json({ ok: false, status: 'ERROR', code: 'VALIDATION_ERROR', messages: [e.message] });
     }
     console.error('Error al emitir nota de crédito.');
-    return res.status(500).json({ status: 'ERROR', message: 'Internal Error' });
+    return res.status(500).json({ ok: false, status: 'ERROR', code: 'INTERNAL_ERROR', message: 'Internal Error' });
   }
 });
 

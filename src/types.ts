@@ -60,6 +60,9 @@ export interface EmitInvoiceInput {
 
 export interface EmitInvoiceOutput {
   status: 'AUTHORIZED' | 'PROCESSING' | 'NOT_AUTHORIZED' | 'ERROR' | 'DEVUELTA';
+  ok?: boolean;
+  code?: string;
+  attempts?: number;
   accessKey?: string;
   authorization?: { number: string; date: string };
   xml_signed_base64?: string;

@@ -1,5 +1,5 @@
 import { EmitInvoiceOutput } from './types';
-import { recepcion, autorizacion, isRecibida, parseAutorizacion } from './sri';
+import { recepcion, autorizacion, isRecibida, parseAutorizacion, SriTransportError, SriSoapFaultError, SriXmlValidationError } from './sri';
 import * as dotenv from 'dotenv';
 import { generateInvoiceXML, generateCreditNoteXML, signXML, InvoiceVersion, Invoice } from 'open-factura-ec';
 import { createHash } from 'crypto';
@@ -99,6 +99,31 @@ function publicErrorMessage(error: unknown, fallback: string): string {
     return fallback;
   }
   return message || fallback;
+}
+
+function sriErrorResponse(error: unknown, accessKey?: string, payloadHash?: string): EmitInvoiceOutput {
+  const code = error instanceof SriTransportError || error instanceof SriSoapFaultError || error instanceof SriXmlValidationError
+    ? error.code
+    : 'SRI_CONNECTION_ERROR';
+  const attempts = error instanceof SriTransportError ? error.attempts : undefined;
+  return {
+    ok: false,
+    status: 'ERROR',
+    code,
+    attempts,
+    accessKey,
+    messages: [error instanceof SriTransportError || error instanceof SriSoapFaultError || error instanceof SriXmlValidationError
+      ? error.message
+      : publicErrorMessage(error, 'No se pudo completar la solicitud al SRI.')],
+    payload_hash: payloadHash
+  };
+}
+
+function normalizeCachedResponse(cached: CachedResponse): CachedResponse {
+  if (cached.status === 'ERROR' || cached.status === 'NOT_AUTHORIZED') {
+    return { ...cached, ok: false, code: cached.code || 'SRI_REJECTED' };
+  }
+  return cached;
 }
 
 type CertificateInput = {
@@ -338,7 +363,33 @@ function extractFromXml(xml: string) {
 
 // ======================= FACTURA (JSON) =======================
 
+const invoicesInFlight = new Map<string, { payloadHash: string; promise: Promise<EmitInvoiceOutput> }>();
+
+function invoiceIdempotencyKey(payload: any): string {
+  return payload?.idempotency_key || `${payload?.infoTributaria?.ruc}-${payload?.infoTributaria?.estab}-${payload?.infoTributaria?.ptoEmi}-${payload?.infoTributaria?.secuencial}-${payload?.infoFactura?.fechaEmision}`;
+}
+
 export async function emitirFactura(payload: any): Promise<EmitInvoiceOutput> {
+  const idempotencyKey = invoiceIdempotencyKey(payload);
+  const requestHash = payloadHash(payload);
+  const inFlight = invoicesInFlight.get(idempotencyKey);
+  if (inFlight) {
+    if (inFlight.payloadHash !== requestHash) {
+      throw new CertificateInputError('La idempotency_key ya está asociada a otro comprobante.');
+    }
+    return inFlight.promise;
+  }
+
+  const operation = emitirFacturaInternal(payload);
+  invoicesInFlight.set(idempotencyKey, { payloadHash: requestHash, promise: operation });
+  try {
+    return await operation;
+  } finally {
+    if (invoicesInFlight.get(idempotencyKey)?.promise === operation) invoicesInFlight.delete(idempotencyKey);
+  }
+}
+
+async function emitirFacturaInternal(payload: any): Promise<EmitInvoiceOutput> {
   const idempotencyKey = payload.idempotency_key || `${payload?.infoTributaria?.ruc}-${payload?.infoTributaria?.estab}-${payload?.infoTributaria?.ptoEmi}-${payload?.infoTributaria?.secuencial}-${payload?.infoFactura?.fechaEmision}`;
   const reqHash = payloadHash(payload);
 
@@ -346,7 +397,10 @@ export async function emitirFactura(payload: any): Promise<EmitInvoiceOutput> {
   const { recepcion: recepcionUrl, autorizacion: autorizacionUrl } = getSriUrls(env);
 
   const cached = await getCachedResponse(idempotencyKey);
-  if (cached && cached.payload_hash === reqHash) return cached;
+  if (cached) {
+    if (cached.payload_hash === reqHash) return normalizeCachedResponse(cached);
+    throw new CertificateInputError('La idempotency_key ya está asociada a otro comprobante.');
+  }
 
   const { version = DEFAULT_VERSION, infoTributaria, infoFactura, detalles, infoAdicional, certificate } = payload;
   if (!infoTributaria || !infoFactura || !detalles || !certificate) {
@@ -360,9 +414,11 @@ const numericCode =
     : numeric8FromKey(idempotencyKey);
 
   const sriInvoice: Invoice = { version: version as InvoiceVersion, infoTributaria, infoFactura, detalles, infoAdicional };
+  let accessKey: string | undefined;
 
   try {
-    const { xml, accessKey } = generateInvoiceXML(sriInvoice, numericCode);
+    const { xml, accessKey: generatedAccessKey } = generateInvoiceXML(sriInvoice, numericCode);
+    accessKey = generatedAccessKey;
     const signedXml = await signXmlWithCertificate(xml, {
       p12_base64: certificate.p12_base64,
       p12_url: certificate.p12_url,
@@ -372,33 +428,41 @@ const numericCode =
     const rec = await recepcion(recepcionUrl, signedXml);
     if (!isRecibida(rec)) {
       const msgs = parseRecepcionMensajes(rec);
-      // ⛔ Opción B: NO cachear estados transitorios
-      return {
+      const out: CachedResponse = {
+        ok: false,
         status: 'ERROR',
+        code: 'SRI_REJECTED',
         accessKey,
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
         messages: msgs,
         payload_hash: reqHash
       };
+      await setCachedResponse(idempotencyKey, out, 24 * 60 * 60);
+      return out;
     }
 	
 	
 
-    const auth = await autorizacion(autorizacionUrl, accessKey);
+    const auth = await autorizacion(autorizacionUrl, accessKey!);
     const parsed = parseAutorizacion(auth);
     if (parsed.estado === 'PENDIENTE' || parsed.estado === 'DESCONOCIDO') {
-      // ⛔ Opción B: NO cachear PROCESSING
-      return {
+      const out: CachedResponse = {
+        ok: true,
         status: 'PROCESSING',
+        code: 'SRI_RECEIVED',
         accessKey,
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
         messages: [parsed.errorMsg || 'Esperando autorización del SRI.'],
         payload_hash: reqHash
       };
+      await setCachedResponse(idempotencyKey, out, 24 * 60 * 60);
+      return out;
     }
     if (parsed.estado === 'NO AUTORIZADO') {
       const out: CachedResponse = {
+        ok: false,
         status: 'NOT_AUTHORIZED',
+        code: 'SRI_REJECTED',
         accessKey,
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
         messages: [parsed.errorMsg || 'El comprobante no fue autorizado.'],
@@ -409,7 +473,9 @@ const numericCode =
     }
 
     const ok: CachedResponse = {
+      ok: true,
       status: 'AUTHORIZED',
+      code: 'SRI_AUTHORIZED',
       accessKey,
       authorization: { number: parsed.number, date: parsed.date },
       xml_signed_base64: Buffer.from(signedXml).toString('base64'),
@@ -421,8 +487,14 @@ const numericCode =
     return ok;
 
   } catch (error) {
-    if (error instanceof CertificateInputError) throw error;
-    return { status: 'ERROR', messages: [publicErrorMessage(error, 'No se pudo firmar o emitir la factura.')] };
+    if (error instanceof CertificateInputError || error instanceof SriXmlValidationError) throw error;
+    const out = sriErrorResponse(error, accessKey, reqHash);
+    if (error instanceof SriTransportError || error instanceof SriSoapFaultError) {
+      // La misma idempotency_key no vuelve a enviar un comprobante cuyo
+      // resultado de transporte/SOAP ya fue determinado.
+      await setCachedResponse(idempotencyKey, out, 24 * 60 * 60);
+    }
+    return out;
   }
 }
 
@@ -470,7 +542,7 @@ export async function emitirFacturaDesdeXML(payload: {
         status: 'ERROR',
         accessKey,
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
-        messages: msgs.length ? msgs : [JSON.stringify(rec)],
+        messages: msgs,
         payload_hash: reqHash
       };
     }
