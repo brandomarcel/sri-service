@@ -692,7 +692,20 @@ export async function emitirNotaCredito(payload: any): Promise<EmitInvoiceOutput
         : numeric8FromKey(idempotencyKey);
 
     const { xml, accessKey: generatedAccessKey } = generateCreditNoteXML(
-      { version: (payload.version || '1.1.0'), infoTributaria, infoNotaCredito, detalles, infoAdicional } as any,
+      {
+        version: (payload.version || '1.1.0'),
+        infoTributaria,
+        // The SRI credit-note totalImpuesto sequence does not allow tarifa;
+        // it optionally allows valorDevolucionIva after valor.
+        infoNotaCredito: {
+          ...infoNotaCredito,
+          totalConImpuestos: Array.isArray(infoNotaCredito.totalConImpuestos)
+            ? infoNotaCredito.totalConImpuestos.map(({ tarifa, ...total }: any) => total)
+            : infoNotaCredito.totalConImpuestos
+        },
+        detalles,
+        infoAdicional
+      } as any,
       numericCode
     );
     accessKey = generatedAccessKey;
