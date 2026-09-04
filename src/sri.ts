@@ -296,24 +296,37 @@ function childText(root: any, name: string): string {
   return String(child?.textContent || '').trim();
 }
 
+/**
+ * Validate a signed Ecuadorian electronic document before sending it to SRI.
+ * The transport is shared by invoices and credit notes, but their document
+ * roots and fiscal information blocks are different.
+ */
 export function validateSignedInvoiceXml(xml: string, expectedEnvironment?: 'test' | 'prod'): { accessKey: string; environment: 'test' | 'prod' } {
   const document = new DOMParser().parseFromString(xml, 'text/xml');
   if (firstElement(document, 'parsererror')) throw new SriXmlValidationError('El XML firmado no está bien formado.');
   const root = document.documentElement;
-  if (!root || (root.localName || root.nodeName?.split(':').pop()) !== 'factura') {
-    throw new SriXmlValidationError('El XML firmado no contiene una factura válida.');
+  const rootName = root && (root.localName || root.nodeName?.split(':').pop());
+  const isInvoice = rootName === 'factura';
+  const isCreditNote = rootName === 'notaCredito';
+  if (!root || (!isInvoice && !isCreditNote)) {
+    throw new SriXmlValidationError('El XML firmado no contiene una factura ni una nota de crédito válida.');
   }
   if (!firstElement(document, 'Signature')) throw new SriXmlValidationError('El XML no contiene una firma digital.');
 
   const requiredTributaria = ['ambiente', 'tipoEmision', 'razonSocial', 'ruc', 'claveAcceso', 'codDoc', 'estab', 'ptoEmi', 'secuencial', 'dirMatriz'];
-  const requiredFactura = ['fechaEmision', 'dirEstablecimiento', 'obligadoContabilidad', 'tipoIdentificacionComprador', 'razonSocialComprador', 'identificacionComprador', 'totalSinImpuestos', 'totalDescuento', 'propina', 'importeTotal', 'moneda'];
   const infoTributaria = firstElement(document, 'infoTributaria');
-  const infoFactura = firstElement(document, 'infoFactura');
   if (!infoTributaria || requiredTributaria.some((field) => !childText(infoTributaria, field))) {
     throw new SriXmlValidationError('La información tributaria del XML está incompleta.');
   }
-  if (!infoFactura || requiredFactura.some((field) => !childText(infoFactura, field))) {
-    throw new SriXmlValidationError('La información de factura del XML está incompleta.');
+  const documentInfoName = isInvoice ? 'infoFactura' : 'infoNotaCredito';
+  const documentInfo = firstElement(document, documentInfoName);
+  const requiredDocumentFields = isInvoice
+    ? ['fechaEmision', 'dirEstablecimiento', 'obligadoContabilidad', 'tipoIdentificacionComprador', 'razonSocialComprador', 'identificacionComprador', 'totalSinImpuestos', 'totalDescuento', 'propina', 'importeTotal', 'moneda']
+    : ['fechaEmision', 'dirEstablecimiento', 'tipoIdentificacionComprador', 'razonSocialComprador', 'identificacionComprador', 'codDocModificado', 'numDocModificado', 'fechaEmisionDocSustento', 'totalSinImpuestos', 'valorModificacion', 'moneda', 'motivo'];
+  if (!documentInfo || requiredDocumentFields.some((field) => !childText(documentInfo, field))) {
+    throw new SriXmlValidationError(
+      isInvoice ? 'La información de factura del XML está incompleta.' : 'La información de nota de crédito del XML está incompleta.'
+    );
   }
 
   const accessKey = childText(infoTributaria, 'claveAcceso');
@@ -329,6 +342,10 @@ export function validateSignedInvoiceXml(xml: string, expectedEnvironment?: 'tes
   }
   if (!['1', '2'].includes(ambiente)) throw new SriXmlValidationError('El ambiente del XML es inválido.');
   if (ruc !== accessKey.slice(10, 23)) throw new SriXmlValidationError('El RUC no coincide con la clave de acceso.');
+  const expectedDocumentCode = isInvoice ? '01' : '04';
+  if (childText(infoTributaria, 'codDoc') !== expectedDocumentCode) {
+    throw new SriXmlValidationError(`El código de documento no corresponde a ${isInvoice ? 'una factura' : 'una nota de crédito'}.`);
+  }
 
   const environment = ambiente === '2' ? 'prod' : 'test';
   if (expectedEnvironment && environment !== expectedEnvironment) {
@@ -336,19 +353,22 @@ export function validateSignedInvoiceXml(xml: string, expectedEnvironment?: 'tes
   }
 
   const details = elementsByName(document, 'detalle');
-  if (!details.length) throw new SriXmlValidationError('La factura debe contener al menos un detalle.');
+  if (!details.length) throw new SriXmlValidationError('El comprobante debe contener al menos un detalle.');
   for (const detail of details) {
-    if (['codigoPrincipal', 'descripcion', 'cantidad', 'precioUnitario', 'descuento', 'precioTotalSinImpuesto'].some((field) => !childText(detail, field))) {
-      throw new SriXmlValidationError('Un detalle de la factura está incompleto.');
+    const code = childText(detail, isInvoice ? 'codigoPrincipal' : 'codigoInterno') || childText(detail, 'codigoPrincipal');
+    if (!code || ['descripcion', 'cantidad', 'precioUnitario', 'descuento', 'precioTotalSinImpuesto'].some((field) => !childText(detail, field))) {
+      throw new SriXmlValidationError('Un detalle del comprobante está incompleto.');
     }
     const taxes = elementsByName(detail, 'impuesto');
     if (!taxes.length || taxes.some((tax) => ['codigo', 'codigoPorcentaje', 'tarifa', 'baseImponible', 'valor'].some((field) => !childText(tax, field)))) {
-      throw new SriXmlValidationError('Un impuesto de la factura está incompleto.');
+      throw new SriXmlValidationError('Un impuesto del comprobante está incompleto.');
     }
   }
-  const payments = elementsByName(infoFactura, 'pago');
-  if (!payments.length || payments.some((payment) => !/^\d{2}$/.test(childText(payment, 'formaPago')) || !childText(payment, 'total'))) {
-    throw new SriXmlValidationError('La factura debe contener formas de pago válidas.');
+  if (isInvoice) {
+    const payments = elementsByName(documentInfo, 'pago');
+    if (!payments.length || payments.some((payment) => !/^\d{2}$/.test(childText(payment, 'formaPago')) || !childText(payment, 'total'))) {
+      throw new SriXmlValidationError('La factura debe contener formas de pago válidas.');
+    }
   }
   return { accessKey, environment };
 }

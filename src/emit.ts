@@ -684,17 +684,18 @@ export async function emitirNotaCredito(payload: any): Promise<EmitInvoiceOutput
   }
   if (!certificate.password) throw new CertificateInputError('Falta la contraseña del certificado.');
 
+  let accessKey: string | undefined;
   try {
-const numericCode =
-  typeof payload.numeric_code === 'string' && /^\d{8}$/.test(payload.numeric_code)
-    ? payload.numeric_code
-    : numeric8FromKey(idempotencyKey);
+    const numericCode =
+      typeof payload.numeric_code === 'string' && /^\d{8}$/.test(payload.numeric_code)
+        ? payload.numeric_code
+        : numeric8FromKey(idempotencyKey);
 
-
-    const { xml, accessKey } = generateCreditNoteXML(
+    const { xml, accessKey: generatedAccessKey } = generateCreditNoteXML(
       { version: (payload.version || '1.1.0'), infoTributaria, infoNotaCredito, detalles, infoAdicional } as any,
       numericCode
     );
+    accessKey = generatedAccessKey;
 
     const signedXml = await signXmlWithCertificate(xml, {
       p12_base64: certificate.p12_base64,
@@ -707,7 +708,9 @@ const numericCode =
       const msgs = parseRecepcionMensajes(rec);
       // ⛔ NO cachear transitorio
       return {
+        ok: false,
         status: 'ERROR',
+        code: 'SRI_REJECTED',
         accessKey,
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
         messages: msgs,
@@ -721,7 +724,9 @@ const numericCode =
     if (parsed.estado === 'PENDIENTE' || parsed.estado === 'DESCONOCIDO') {
       // ⛔ NO cachear transitorio
       return {
+        ok: true,
         status: 'PROCESSING',
+        code: 'SRI_RECEIVED',
         accessKey,
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
         messages: [parsed.errorMsg || 'Esperando autorización del SRI.'],
@@ -730,7 +735,9 @@ const numericCode =
     }
     if (parsed.estado === 'NO AUTORIZADO') {
       const out: CachedResponse = {
+        ok: false,
         status: 'NOT_AUTHORIZED',
+        code: 'SRI_REJECTED',
         accessKey,
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
         messages: [parsed.errorMsg || 'La nota de crédito no fue autorizada.'],
@@ -741,7 +748,9 @@ const numericCode =
     }
 
     const ok: CachedResponse = {
+      ok: true,
       status: 'AUTHORIZED',
+      code: 'SRI_AUTHORIZED',
       accessKey,
       authorization: { number: parsed.number, date: parsed.date },
       xml_signed_base64: Buffer.from(signedXml).toString('base64'),
@@ -753,8 +762,12 @@ const numericCode =
     return ok;
 
   } catch (err) {
-    if (err instanceof CertificateInputError) throw err;
-    return { status: 'ERROR', messages: [publicErrorMessage(err, 'No se pudo firmar o emitir la nota de crédito.')] };
+    if (err instanceof CertificateInputError || err instanceof SriXmlValidationError) throw err;
+    const out = sriErrorResponse(err, accessKey, reqHash);
+    if (err instanceof SriTransportError || err instanceof SriSoapFaultError) {
+      await setCachedResponse(idempotencyKey, out, 24 * 60 * 60);
+    }
+    return out;
   }
 }
 
