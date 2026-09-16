@@ -1,7 +1,15 @@
 import { EmitInvoiceOutput } from './types';
 import { recepcion, autorizacion, autorizacionConPolling, isRecibida, parseAutorizacion, SriTransportError, SriSoapFaultError, SriXmlValidationError } from './sri';
 import * as dotenv from 'dotenv';
-import { generateInvoiceXML, generateCreditNoteXML, signXML, InvoiceVersion, Invoice } from 'open-factura-ec';
+import {
+  generateInvoiceXML,
+  generateCreditNoteXML,
+  generateDebitNoteXML,
+  generateRemissionGuideXML,
+  signXML,
+  InvoiceVersion,
+  Invoice
+} from 'open-factura-ec';
 import { createHash } from 'crypto';
 import { createClient } from 'redis';
 import * as fs from 'fs';
@@ -361,15 +369,67 @@ function extractFromXml(xml: string) {
   return { accessKey: key, ambiente: amb ? (amb === '2' ? 'prod' : 'test') : null };
 }
 
+
+type ElectronicDocumentPayload = {
+  idempotency_key?: string;
+  infoTributaria?: any;
+  infoFactura?: any;
+  infoNotaCredito?: any;
+  infoNotaDebito?: any;
+  infoGuiaRemision?: any;
+  proveedor_ruc?: string;
+  infoAdicional?: { campos?: Array<{ nombre: string; valor: string }> };
+  [key: string]: any;
+};
+
+function documentDate(payload: ElectronicDocumentPayload): string {
+  return payload.infoFactura?.fechaEmision
+    || payload.infoNotaCredito?.fechaEmision
+    || payload.infoNotaDebito?.fechaEmision
+    || payload.infoGuiaRemision?.fechaIniTransporte
+    || '';
+}
+
+function documentIdempotencyKey(payload: ElectronicDocumentPayload): string {
+  return payload.idempotency_key
+    || `${payload.infoTributaria?.ruc}-${payload.infoTributaria?.estab}-${payload.infoTributaria?.ptoEmi}-${payload.infoTributaria?.secuencial}-${documentDate(payload)}`;
+}
+
+/**
+ * Anexo 26 de la ficha SRI 2.34: cuando la emisión se realiza mediante un
+ * proveedor tecnológico, el RUC del proveedor debe viajar en infoAdicional.
+ */
+function withProviderRuc<T extends ElectronicDocumentPayload>(payload: T): T {
+  const providerRuc = payload.proveedor_ruc || process.env.SRI_PROVEEDOR_RUC;
+  if (!providerRuc) return payload;
+  if (!/^\d{13}$/.test(providerRuc)) {
+    throw new CertificateInputError('proveedor_ruc debe contener 13 dígitos numéricos.');
+  }
+
+  const configuredFields = payload.infoAdicional?.campos;
+  const fields = Array.isArray(configuredFields) ? [...configuredFields] : [];
+  const existing = fields.find((field) => field.nombre === 'RUC Proveedor');
+  if (existing && existing.valor !== providerRuc) {
+    throw new CertificateInputError('El RUC Proveedor del comprobante no coincide con la configuración de la API.');
+  }
+  if (!existing) fields.push({ nombre: 'RUC Proveedor', valor: providerRuc });
+
+  return {
+    ...payload,
+    infoAdicional: { ...(payload.infoAdicional || {}), campos: fields }
+  };
+}
+
 // ======================= FACTURA (JSON) =======================
 
 const invoicesInFlight = new Map<string, { payloadHash: string; promise: Promise<EmitInvoiceOutput> }>();
 
 function invoiceIdempotencyKey(payload: any): string {
-  return payload?.idempotency_key || `${payload?.infoTributaria?.ruc}-${payload?.infoTributaria?.estab}-${payload?.infoTributaria?.ptoEmi}-${payload?.infoTributaria?.secuencial}-${payload?.infoFactura?.fechaEmision}`;
+  return documentIdempotencyKey(payload);
 }
 
 export async function emitirFactura(payload: any): Promise<EmitInvoiceOutput> {
+  payload = withProviderRuc(payload);
   const idempotencyKey = invoiceIdempotencyKey(payload);
   const requestHash = payloadHash(payload);
   const inFlight = invoicesInFlight.get(idempotencyKey);
@@ -475,7 +535,8 @@ function queueAuthorizationPolling(params: {
 }
 
 async function emitirFacturaInternal(payload: any): Promise<EmitInvoiceOutput> {
-  const idempotencyKey = payload.idempotency_key || `${payload?.infoTributaria?.ruc}-${payload?.infoTributaria?.estab}-${payload?.infoTributaria?.ptoEmi}-${payload?.infoTributaria?.secuencial}-${payload?.infoFactura?.fechaEmision}`;
+  payload = withProviderRuc(payload);
+  const idempotencyKey = documentIdempotencyKey(payload);
   const reqHash = payloadHash(payload);
 
   const env = payload.env || 'test';
@@ -668,8 +729,8 @@ export async function emitirFacturaDesdeXML(payload: {
 // ======================= NOTA DE CRÉDITO (JSON) =======================
 
 export async function emitirNotaCredito(payload: any): Promise<EmitInvoiceOutput> {
-  const idempotencyKey = payload.idempotency_key
-    || `${payload?.infoTributaria?.ruc}-${payload?.infoTributaria?.estab}-${payload?.infoTributaria?.ptoEmi}-${payload?.infoTributaria?.secuencial}-${payload?.infoNotaCredito?.fechaEmision}`;
+  payload = withProviderRuc(payload);
+  const idempotencyKey = documentIdempotencyKey(payload);
 
   const reqHash = payloadHash(payload);
   const env = payload.env || 'test';
@@ -782,6 +843,146 @@ export async function emitirNotaCredito(payload: any): Promise<EmitInvoiceOutput
     }
     return out;
   }
+}
+
+
+// ======================= NOTA DE DÉBITO / GUÍA DE REMISIÓN =======================
+
+type XmlDocumentGenerator = (document: any, numericCode: string) => { xml: string; accessKey: string };
+
+async function emitirDocumentoGenerado(
+  payload: any,
+  generator: XmlDocumentGenerator,
+  label: string
+): Promise<EmitInvoiceOutput> {
+  payload = withProviderRuc(payload);
+  const idempotencyKey = documentIdempotencyKey(payload);
+  const reqHash = payloadHash(payload);
+  const env = payload.env || 'test';
+  const { recepcion: recepcionUrl, autorizacion: autorizacionUrl } = getSriUrls(env);
+
+  const cached = await getCachedResponse(idempotencyKey);
+  if (cached) {
+    if (cached.payload_hash === reqHash) return normalizeCachedResponse(cached);
+    throw new CertificateInputError('La idempotency_key ya está asociada a otro comprobante.');
+  }
+
+  const { infoTributaria, certificate } = payload;
+  if (!infoTributaria || !certificate) {
+    throw new CertificateInputError(`Datos incompletos para ${label}.`);
+  }
+  if (!certificate.password) throw new CertificateInputError('Falta la contraseña del certificado.');
+
+  const numericCode = typeof payload.numeric_code === 'string' && /^\d{8}$/.test(payload.numeric_code)
+    ? payload.numeric_code
+    : numeric8FromKey(idempotencyKey);
+  let accessKey: string | undefined;
+
+  try {
+    let generated: { xml: string; accessKey: string };
+    try {
+      generated = generator(payload, numericCode);
+    } catch (error) {
+      throw new CertificateInputError(publicErrorMessage(error, `Datos inválidos para ${label}.`));
+    }
+    accessKey = generated.accessKey;
+
+    const signedXml = await signXmlWithCertificate(generated.xml, {
+      p12_base64: certificate.p12_base64,
+      p12_url: certificate.p12_url,
+      p12_path: certificate.p12_path
+    }, certificate.password);
+
+    const rec = await recepcion(recepcionUrl, signedXml);
+    if (!isRecibida(rec)) {
+      return {
+        ok: false,
+        status: 'ERROR',
+        code: 'SRI_REJECTED',
+        accessKey,
+        xml_signed_base64: Buffer.from(signedXml).toString('base64'),
+        messages: parseRecepcionMensajes(rec),
+        payload_hash: reqHash
+      };
+    }
+
+    const auth = await autorizacion(autorizacionUrl, accessKey);
+    const parsed = parseAutorizacion(auth);
+
+    if (parsed.estado === 'PENDIENTE' || parsed.estado === 'DESCONOCIDO') {
+      return {
+        ok: true,
+        status: 'PROCESSING',
+        code: 'SRI_RECEIVED',
+        accessKey,
+        xml_signed_base64: Buffer.from(signedXml).toString('base64'),
+        messages: [parsed.errorMsg || `Esperando autorización de ${label}.`],
+        payload_hash: reqHash
+      };
+    }
+    if (parsed.estado === 'NO AUTORIZADO') {
+      const out: CachedResponse = {
+        ok: false,
+        status: 'NOT_AUTHORIZED',
+        code: 'SRI_REJECTED',
+        accessKey,
+        xml_signed_base64: Buffer.from(signedXml).toString('base64'),
+        messages: [parsed.errorMsg || `${label} no fue autorizado.`],
+        payload_hash: reqHash
+      };
+      await setCachedResponse(idempotencyKey, out, 24 * 60 * 60);
+      return out;
+    }
+
+    const out: CachedResponse = {
+      ok: true,
+      status: 'AUTHORIZED',
+      code: 'SRI_AUTHORIZED',
+      accessKey,
+      authorization: { number: parsed.number, date: parsed.date },
+      xml_signed_base64: Buffer.from(signedXml).toString('base64'),
+      xml_authorized_base64: parsed.xmlAut ? Buffer.from(parsed.xmlAut).toString('base64') : undefined,
+      messages: [],
+      payload_hash: reqHash
+    };
+    await setCachedResponse(idempotencyKey, out, 24 * 60 * 60);
+    return out;
+  } catch (error) {
+    if (error instanceof CertificateInputError || error instanceof SriXmlValidationError) throw error;
+    const out = sriErrorResponse(error, accessKey, reqHash);
+    if (error instanceof SriTransportError || error instanceof SriSoapFaultError) {
+      await setCachedResponse(idempotencyKey, out, 24 * 60 * 60);
+    }
+    return out;
+  }
+}
+
+export async function emitirNotaDebito(payload: any): Promise<EmitInvoiceOutput> {
+  return emitirDocumentoGenerado(
+    payload,
+    (document, numericCode) => generateDebitNoteXML({
+      version: document.version || '1.0.0',
+      infoTributaria: document.infoTributaria,
+      infoNotaDebito: document.infoNotaDebito,
+      motivos: document.motivos,
+      infoAdicional: document.infoAdicional
+    }, numericCode),
+    'la nota de débito'
+  );
+}
+
+export async function emitirGuiaRemision(payload: any): Promise<EmitInvoiceOutput> {
+  return emitirDocumentoGenerado(
+    payload,
+    (document, numericCode) => generateRemissionGuideXML({
+      version: document.version || '1.1.0',
+      infoTributaria: document.infoTributaria,
+      infoGuiaRemision: document.infoGuiaRemision,
+      destinatarios: document.destinatarios,
+      infoAdicional: document.infoAdicional
+    }, numericCode),
+    'la guía de remisión'
+  );
 }
 
 // Utils de estado del servicio

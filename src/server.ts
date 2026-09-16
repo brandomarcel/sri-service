@@ -19,7 +19,7 @@ setNodeDependencies({
 // 3) Resto de imports
 import express from 'express';
 import { z } from 'zod';
-import { emitirFactura, emitirFacturaDesdeXML, emitirNotaCredito } from './emit';
+import { emitirFactura, emitirFacturaDesdeXML, emitirNotaCredito, emitirNotaDebito, emitirGuiaRemision } from './emit';
 import { autorizacion, parseAutorizacion,recepcion } from './sri';
 import { getSriUrls } from './sri-config';
 
@@ -45,7 +45,7 @@ export const invoiceSchema = z.object({
   idempotency_key: z.string().min(6).optional(),
   env: z.enum(['test','prod']).optional(),
   numeric_code: z.string().regex(/^\d{8}$/).optional(),
-
+  proveedor_ruc: z.string().regex(/^\d{13}$/).optional(),
   version: z.string().optional().default('2.1.0'),
   certificate: certificateSchema,
 
@@ -199,6 +199,7 @@ const creditNoteSchema = z.object({
   idempotency_key: z.string().min(6).optional(),
   env: z.enum(['test','prod']).optional(),
   numeric_code: z.string().regex(/^\d{8}$/).optional(),
+  proveedor_ruc: z.string().regex(/^\d{13}$/).optional(),
   version: z.string().optional().default('1.1.0'),
   certificate: z.object({
     p12_base64: z.string().optional(),
@@ -207,6 +208,34 @@ const creditNoteSchema = z.object({
   infoTributaria: z.any(),
   infoNotaCredito: z.any(),
   detalles: z.any(),
+  infoAdicional: z.any().optional()
+});
+
+
+// --- Schemas para NOTA DE DÉBITO y GUÍA DE REMISIÓN ---
+const debitNoteSchema = z.object({
+  idempotency_key: z.string().min(6).optional(),
+  env: z.enum(['test', 'prod']).optional(),
+  numeric_code: z.string().regex(/^\d{8}$/).optional(),
+  version: z.literal('1.0.0').optional().default('1.0.0'),
+  proveedor_ruc: z.string().regex(/^\d{13}$/).optional(),
+  certificate: certificateSchema,
+  infoTributaria: z.any(),
+  infoNotaDebito: z.any(),
+  motivos: z.array(z.any()).min(1),
+  infoAdicional: z.any().optional()
+});
+
+const remissionGuideSchema = z.object({
+  idempotency_key: z.string().min(6).optional(),
+  env: z.enum(['test', 'prod']).optional(),
+  numeric_code: z.string().regex(/^\d{8}$/).optional(),
+  version: z.enum(['1.0.0', '1.1.0']).optional().default('1.1.0'),
+  proveedor_ruc: z.string().regex(/^\d{13}$/).optional(),
+  certificate: certificateSchema,
+  infoTributaria: z.any(),
+  infoGuiaRemision: z.any(),
+  destinatarios: z.array(z.any()).min(1),
   infoAdicional: z.any().optional()
 });
 
@@ -325,8 +354,43 @@ app.post('/api/v1/credit-notes/emit', async (req, res) => {
   }
 });
 
+
+// Emitir NOTA DE DÉBITO (JSON canónico)
+app.post('/api/v1/debit-notes/emit', async (req, res) => {
+  try {
+    const parsed = debitNoteSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ ok: false, status: 'ERROR', code: 'VALIDATION_ERROR', message: 'Formato de datos inválido', issues: parsed.error.errors });
+    }
+    return res.json(await emitirNotaDebito(parsed.data));
+  } catch (e: any) {
+    if (e?.statusCode === 400) {
+      return res.status(400).json({ ok: false, status: 'ERROR', code: 'VALIDATION_ERROR', messages: [e.message] });
+    }
+    console.error('Error al emitir nota de débito.');
+    return res.status(500).json({ ok: false, status: 'ERROR', code: 'INTERNAL_ERROR', message: 'Internal Error' });
+  }
+});
+
+// Emitir GUÍA DE REMISIÓN (JSON canónico)
+app.post('/api/v1/remission-guides/emit', async (req, res) => {
+  try {
+    const parsed = remissionGuideSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ ok: false, status: 'ERROR', code: 'VALIDATION_ERROR', message: 'Formato de datos inválido', issues: parsed.error.errors });
+    }
+    return res.json(await emitirGuiaRemision(parsed.data));
+  } catch (e: any) {
+    if (e?.statusCode === 400) {
+      return res.status(400).json({ ok: false, status: 'ERROR', code: 'VALIDATION_ERROR', messages: [e.message] });
+    }
+    console.error('Error al emitir guía de remisión.');
+    return res.status(500).json({ ok: false, status: 'ERROR', code: 'INTERNAL_ERROR', message: 'Internal Error' });
+  }
+});
+
 // Endpoint de status (sirve para cualquier clave)
-app.get('/api/v1/invoices/:accessKey/status', async (req, res) => {
+app.get(['/api/v1/invoices/:accessKey/status', '/api/v1/documents/:accessKey/status'], async (req, res) => {
   try {
     const { accessKey } = req.params;
     const { env } = req.query as { env: 'test' | 'prod' };
