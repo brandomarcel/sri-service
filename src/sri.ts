@@ -31,6 +31,7 @@ export type SriErrorCode =
   | 'SRI_TLS_ERROR'
   | 'SRI_CONNECTION_ERROR'
   | 'SRI_SOAP_FAULT'
+  | 'SRI_HTTP_REDIRECT'
   | 'SRI_XML_INVALID'
   | 'SRI_REJECTED'
   | 'SRI_RECEIVED'
@@ -58,6 +59,19 @@ export class SriSoapFaultError extends Error {
     super(message);
     this.name = 'SriSoapFaultError';
     this.statusCode = statusCode;
+  }
+}
+
+export class SriHttpRedirectError extends Error {
+  readonly code = 'SRI_HTTP_REDIRECT' as const;
+  readonly statusCode: number;
+  readonly location?: string;
+
+  constructor(statusCode: number, location?: string) {
+    super(`El endpoint SOAP del SRI respondió HTTP ${statusCode} en lugar de una respuesta SOAP.`);
+    this.name = 'SriHttpRedirectError';
+    this.statusCode = statusCode;
+    this.location = location;
   }
 }
 
@@ -215,6 +229,17 @@ function postSoapOnce(endpoint: string, envelope: string, operation: SriOperatio
         const durationMs = Date.now() - startedAt;
         const statusCode = response.statusCode || 0;
         logSoap(operation, endpoint, accessKey, { attempt, durationMs, statusCode });
+        if (statusCode >= 300 && statusCode < 400) {
+          const locationHeader = response.headers?.location;
+          const location = Array.isArray(locationHeader) ? locationHeader[0] : locationHeader;
+          console.warn(
+            `[SRI SOAP] ${operation} redirect ` +
+            `accessKey=${maskAccessKey(accessKey)} attempt=${attempt} ` +
+            `statusHttp=${statusCode} location=${location || 'none'}`
+          );
+          reject(new SriHttpRedirectError(statusCode, location));
+          return;
+        }
         if (size > 10 * 1024 * 1024) {
           reject(new SriSoapFaultError('La respuesta SOAP del SRI excede el tamaño permitido.', statusCode));
           return;

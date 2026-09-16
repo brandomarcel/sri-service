@@ -485,6 +485,15 @@ app.get(['/api/v1/invoices/:accessKey/status', '/api/v1/documents/:accessKey/sta
 
   } catch (e: any) {
     console.error('Error al consultar estado:', e);
+    if (typeof e?.code === 'string' && e.code.startsWith('SRI_')) {
+      return res.status(502).json({
+        ok: false,
+        status: 'ERROR',
+        code: e.code,
+        accessKey: req.params.accessKey,
+        messages: [e.message || 'No se pudo consultar el estado en el SRI.']
+      });
+    }
     return res.status(500).json({ status: 'ERROR', messages: [e?.message || 'Internal Error'] });
   }
 });

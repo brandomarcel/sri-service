@@ -5,6 +5,7 @@ const { test } = require('node:test');
 
 const {
   SriSoapFaultError,
+  SriHttpRedirectError,
   SriTransportError,
   autorizacion,
   autorizacionConPolling,
@@ -23,9 +24,10 @@ function signedInvoice() {
   return `<factura><infoTributaria><ambiente>1</ambiente><tipoEmision>1</tipoEmision><razonSocial>Empresa</razonSocial><ruc>1234567890123</ruc><claveAcceso>${accessKey}</claveAcceso><codDoc>01</codDoc><estab>001</estab><ptoEmi>001</ptoEmi><secuencial>000000001</secuencial><dirMatriz>Matriz</dirMatriz></infoTributaria><infoFactura><fechaEmision>02/09/2026</fechaEmision><dirEstablecimiento>Establecimiento</dirEstablecimiento><obligadoContabilidad>SI</obligadoContabilidad><tipoIdentificacionComprador>05</tipoIdentificacionComprador><razonSocialComprador>Cliente</razonSocialComprador><identificacionComprador>0102030405</identificacionComprador><totalSinImpuestos>10.00</totalSinImpuestos><totalDescuento>0.00</totalDescuento><propina>0.00</propina><importeTotal>10.00</importeTotal><moneda>DOLAR</moneda><pagos><pago><formaPago>01</formaPago><total>10.00</total></pago></pagos></infoFactura><detalles><detalle><codigoPrincipal>A</codigoPrincipal><descripcion>Producto</descripcion><cantidad>1.00</cantidad><precioUnitario>10.00</precioUnitario><descuento>0.00</descuento><precioTotalSinImpuesto>10.00</precioTotalSinImpuesto><impuestos><impuesto><codigo>2</codigo><codigoPorcentaje>0</codigoPorcentaje><tarifa>0</tarifa><baseImponible>10.00</baseImponible><valor>0.00</valor></impuesto></impuestos></detalle></detalles><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"/></factura>`;
 }
 
-function soapResponse(body, statusCode = 200) {
+function soapResponse(body, statusCode = 200, headers = {}) {
   const response = new EventEmitter();
   response.statusCode = statusCode;
+  response.headers = headers;
   process.nextTick(() => {
     response.emit('data', Buffer.from(body));
     response.emit('end');
@@ -99,6 +101,23 @@ test('clasifica timeout y reintenta solo errores transitorios', async () => {
       (error) => error instanceof SriTransportError && error.code === 'SRI_TIMEOUT'
     );
     assert.equal(mock.calls.length, 3);
+  } finally {
+    mock.restore();
+  }
+});
+
+test('clasifica HTTP 302 como redirección y no sigue la IP ni reintenta', async () => {
+  const mock = mockHttps(({ callback }) => callback(soapResponse('', 302, {
+    location: 'https://181.113.227.222'
+  })));
+  try {
+    await assert.rejects(
+      () => postSoapWithRetry(wsdl, '<soap/>', 'recepcion', accessKey, { maxAttempts: 3, backoffMs: 0, timeoutMs: 10 }),
+      (error) => error instanceof SriHttpRedirectError &&
+        error.code === 'SRI_HTTP_REDIRECT' &&
+        error.statusCode === 302
+    );
+    assert.equal(mock.calls.length, 1);
   } finally {
     mock.restore();
   }

@@ -1,5 +1,5 @@
 import { EmitInvoiceOutput } from './types';
-import { recepcion, autorizacion, autorizacionConPolling, isRecibida, parseAutorizacion, SriTransportError, SriSoapFaultError, SriXmlValidationError } from './sri';
+import { recepcion, autorizacion, autorizacionConPolling, isRecibida, parseAutorizacion, SriTransportError, SriSoapFaultError, SriHttpRedirectError, SriXmlValidationError } from './sri';
 import * as dotenv from 'dotenv';
 import {
   generateInvoiceXML,
@@ -110,7 +110,7 @@ function publicErrorMessage(error: unknown, fallback: string): string {
 }
 
 function sriErrorResponse(error: unknown, accessKey?: string, payloadHash?: string): EmitInvoiceOutput {
-  const code = error instanceof SriTransportError || error instanceof SriSoapFaultError || error instanceof SriXmlValidationError
+  const code = error instanceof SriTransportError || error instanceof SriSoapFaultError || error instanceof SriHttpRedirectError || error instanceof SriXmlValidationError
     ? error.code
     : 'SRI_CONNECTION_ERROR';
   const attempts = error instanceof SriTransportError ? error.attempts : undefined;
@@ -120,7 +120,7 @@ function sriErrorResponse(error: unknown, accessKey?: string, payloadHash?: stri
     code,
     attempts,
     accessKey,
-    messages: [error instanceof SriTransportError || error instanceof SriSoapFaultError || error instanceof SriXmlValidationError
+    messages: [error instanceof SriTransportError || error instanceof SriSoapFaultError || error instanceof SriHttpRedirectError || error instanceof SriXmlValidationError
       ? error.message
       : publicErrorMessage(error, 'No se pudo completar la solicitud al SRI.')],
     payload_hash: payloadHash
@@ -518,7 +518,9 @@ function queueAuthorizationPolling(params: {
       return out;
     } catch (error) {
       const out = sriErrorResponse(error, params.accessKey, params.payloadHash);
-      await setCachedResponse(params.idempotencyKey, out, 24 * 60 * 60);
+      if (!(error instanceof SriHttpRedirectError)) {
+        await setCachedResponse(params.idempotencyKey, out, 24 * 60 * 60);
+      }
       console.error(
         `[SRI ASYNC] autorización fallida ` +
         `environment=${params.environment} accessKey=${params.accessKey} ` +
