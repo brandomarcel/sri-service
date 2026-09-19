@@ -20,7 +20,7 @@ setNodeDependencies({
 import express from 'express';
 import { z } from 'zod';
 import { emitirFactura, emitirFacturaDesdeXML, emitirNotaCredito, emitirNotaDebito, emitirGuiaRemision } from './emit';
-import { autorizacion, parseAutorizacion, maskAccessKey } from './sri';
+import { autorizacion, parseAutorizacion, maskAccessKey, SriHttpRedirectError } from './sri';
 import { getSriUrls } from './sri-config';
 
 const app = express();
@@ -429,7 +429,28 @@ app.get(['/api/v1/invoices/:accessKey/status', '/api/v1/documents/:accessKey/sta
         `[SRI STATUS] consulta autorización environment=${amb} ` +
         `endpoint=${urls.autorizacion} accessKey=${maskAccessKey(accessKey)}`
       );
-      const authResponse = await autorizacion(urls.autorizacion, accessKey, { maxAttempts: 1 });
+      let authResponse;
+      try {
+        authResponse = await autorizacion(urls.autorizacion, accessKey, { maxAttempts: 1 });
+      } catch (error) {
+        if (error instanceof SriHttpRedirectError) {
+          console.warn(
+            '[SRI STATUS] autorización pendiente por redirección ' +
+            'environment=' + amb +
+            ' accessKey=' + maskAccessKey(accessKey) +
+            ' statusHttp=' + error.statusCode
+          );
+          return {
+            ok: true,
+            status: 'PROCESSING' as const,
+            code: 'SRI_AUTHORIZATION_PENDING',
+            accessKey,
+            environment: amb,
+            messages: ['La autorización continúa pendiente. El SRI respondió temporalmente con una redirección.']
+          };
+        }
+        throw error;
+      }
       const parsed = parseAutorizacion(authResponse);
 
       if (parsed.estado === 'AUTORIZADO') {

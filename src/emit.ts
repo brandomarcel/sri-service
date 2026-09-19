@@ -632,20 +632,22 @@ function queueAuthorizationPolling(params: {
       await setCachedResponse(params.idempotencyKey, out, 24 * 60 * 60);
       return out;
     } catch (error) {
-      const out: CachedResponse = isRetryableSriError(error)
+      const out: CachedResponse = isRetryableSriError(error) || error instanceof SriHttpRedirectError
         ? {
             ok: true,
             status: 'PROCESSING',
-            code: 'SRI_RECEIVED',
+            code: error instanceof SriHttpRedirectError ? 'SRI_AUTHORIZATION_PENDING' : 'SRI_RECEIVED',
             accessKey: params.accessKey,
             xml_signed_base64: Buffer.from(params.signedXml).toString('base64'),
-            messages: ['La solicitud pudo haber llegado al SRI; la autorización continuará en segundo plano.'],
+            messages: [
+              error instanceof SriHttpRedirectError
+                ? 'La autorización continúa pendiente. El SRI respondió temporalmente con una redirección.'
+                : 'La solicitud pudo haber llegado al SRI; la autorización continuará en segundo plano.'
+            ],
             payload_hash: params.payloadHash
           }
         : sriErrorResponse(error, params.accessKey, params.payloadHash) as CachedResponse;
-      if (!(error instanceof SriHttpRedirectError)) {
-        await setCachedResponse(params.idempotencyKey, out, 24 * 60 * 60);
-      }
+      await setCachedResponse(params.idempotencyKey, out, 24 * 60 * 60);
       console.error(
         `[SRI ASYNC] autorización fallida ` +
         `environment=${params.environment} accessKey=${maskAccessKey(params.accessKey)} ` +
