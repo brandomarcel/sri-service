@@ -26,6 +26,9 @@ export function endpointFromWsdl(wsdlUrl: string): string {
 export type SriErrorCode =
   | 'SRI_CONNECTION_RESET'
   | 'SRI_TIMEOUT'
+  | 'SRI_HTTP_502'
+  | 'SRI_HTTP_503'
+  | 'SRI_HTTP_504'
   | 'SRI_CONNECTION_REFUSED'
   | 'SRI_PIPE'
   | 'SRI_TLS_ERROR'
@@ -41,10 +44,12 @@ export class SriTransportError extends Error {
   readonly code: SriErrorCode;
   readonly attempts: number;
   readonly statusCode?: number;
+  readonly phase?: 'connect' | 'read';
 
-  constructor(code: SriErrorCode, message: string, attempts = 1, statusCode?: number) {
+  constructor(code: SriErrorCode, message: string, attempts = 1, statusCode?: number, phase?: 'connect' | 'read') {
     super(message);
     this.name = 'SriTransportError';
+    this.phase = phase;
     this.code = code;
     this.attempts = attempts;
     this.statusCode = statusCode;
@@ -94,6 +99,8 @@ export type SoapHttpResponse = {
 
 export type SoapRequestOptions = {
   timeoutMs?: number;
+  connectionTimeoutMs?: number;
+  readTimeoutMs?: number;
   maxAttempts?: number;
   backoffMs?: number;
 };
@@ -114,7 +121,7 @@ function environmentFromWsdl(wsdlUrl: string): 'test' | 'prod' {
   return new URL(wsdlUrl).hostname.startsWith('celcer.') ? 'test' : 'prod';
 }
 
-function maskAccessKey(accessKey?: string): string {
+export function maskAccessKey(accessKey?: string): string {
   if (!accessKey) return 'unknown';
   return accessKey.length > 14 ? `${accessKey.slice(0, 10)}...${accessKey.slice(-4)}` : 'invalid';
 }
@@ -136,6 +143,9 @@ function transportMessage(code: SriErrorCode): string {
     case 'SRI_CONNECTION_RESET': return 'El SRI cerró la conexión durante la solicitud SOAP.';
     case 'SRI_TIMEOUT': return 'El SRI no respondió dentro del tiempo establecido.';
     case 'SRI_CONNECTION_REFUSED': return 'No se pudo establecer conexión con el SRI.';
+    case 'SRI_HTTP_502': return 'El SRI devolvió HTTP 502 temporalmente.';
+    case 'SRI_HTTP_503': return 'El SRI devolvió HTTP 503 temporalmente.';
+    case 'SRI_HTTP_504': return 'El SRI devolvió HTTP 504 temporalmente.';
     case 'SRI_PIPE': return 'La conexión con el SRI se interrumpió durante la solicitud SOAP.';
     case 'SRI_TLS_ERROR': return 'No se pudo establecer una conexión TLS válida con el SRI.';
     default: return 'No se pudo completar la solicitud SOAP al SRI.';
@@ -147,6 +157,7 @@ function logSoap(operation: SriOperation, wsdlUrl: string, accessKey: string | u
   durationMs: number;
   statusCode?: number;
   code?: string;
+  phase?: 'connect' | 'read';
 }) {
   const fields = [
     `environment=${environmentFromWsdl(wsdlUrl)}`,
@@ -156,6 +167,7 @@ function logSoap(operation: SriOperation, wsdlUrl: string, accessKey: string | u
     `attempt=${details.attempt}`,
     `durationMs=${details.durationMs}`
   ];
+  if (details.phase) fields.push(`phase=${details.phase}`);
   if (details.statusCode !== undefined) fields.push(`statusHttp=${details.statusCode}`);
   if (details.code) fields.push(`code=${details.code}`);
   console.info(`[SRI SOAP] ${operation} ${details.code ? 'failed' : 'completed'} ${fields.join(' ')}`);
@@ -186,18 +198,35 @@ function soapEnvelope(operation: SriOperation, value: string): string {
     `<soapenv:Header/><soapenv:Body>${body}</soapenv:Body></soapenv:Envelope>`;
 }
 
-function postSoapOnce(endpoint: string, envelope: string, operation: SriOperation, accessKey: string | undefined, timeoutMs: number, attempt: number): Promise<SoapHttpResponse> {
+function httpRetryCode(statusCode: number): SriErrorCode | undefined {
+  if (statusCode === 502) return 'SRI_HTTP_502';
+  if (statusCode === 503) return 'SRI_HTTP_503';
+  if (statusCode === 504) return 'SRI_HTTP_504';
+  return undefined;
+}
+
+function postSoapOnce(endpoint: string, envelope: string, operation: SriOperation, accessKey: string | undefined, connectionTimeoutMs: number, readTimeoutMs: number, attempt: number): Promise<SoapHttpResponse> {
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
     const body = Buffer.from(envelope, 'utf8');
+    let readTimer: NodeJS.Timeout | undefined;
+    let connectionTimer: NodeJS.Timeout | undefined;
+    const resetReadTimer = () => {
+      clearTimeout(readTimer);
+      readTimer = setTimeout(() => {
+        request.destroy(Object.assign(new Error('SRI read timeout'), { code: 'ETIMEDOUT', phase: 'read' }));
+      }, readTimeoutMs);
+    };
     let settled = false;
     const fail = (error: any) => {
       if (settled) return;
       settled = true;
       const durationMs = Date.now() - startedAt;
       const code = transportCode(error);
-      logSoap(operation, endpoint, accessKey, { attempt, durationMs, code });
-      reject(new SriTransportError(code, transportMessage(code), attempt));
+      clearTimeout(connectionTimer);
+      clearTimeout(readTimer);
+      logSoap(operation, endpoint, accessKey, { attempt, durationMs, code, phase: error?.phase });
+      reject(new SriTransportError(code, transportMessage(code), attempt, undefined, error?.phase));
     };
     const request = https.request(endpoint, {
       method: 'POST',
@@ -214,21 +243,32 @@ function postSoapOnce(endpoint: string, envelope: string, operation: SriOperatio
         'Connection': 'close'
       }
     }, (response) => {
+      clearTimeout(connectionTimer);
+      resetReadTimer();
       const chunks: Buffer[] = [];
       let size = 0;
       response.on('data', (chunk) => {
         const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
         size += buffer.length;
         if (size <= 10 * 1024 * 1024) chunks.push(buffer);
+        resetReadTimer();
       });
       response.on('aborted', () => fail({ code: 'ECONNRESET' }));
       response.on('error', fail);
       response.on('end', () => {
         if (settled) return;
         settled = true;
+        clearTimeout(connectionTimer);
+        clearTimeout(readTimer);
         const durationMs = Date.now() - startedAt;
         const statusCode = response.statusCode || 0;
         logSoap(operation, endpoint, accessKey, { attempt, durationMs, statusCode });
+        const retryCode = httpRetryCode(statusCode);
+        if (retryCode) {
+          logSoap(operation, endpoint, accessKey, { attempt, durationMs, statusCode, code: retryCode });
+          reject(new SriTransportError(retryCode, transportMessage(retryCode), attempt, statusCode));
+          return;
+        }
         if (statusCode >= 300 && statusCode < 400) {
           const locationHeader = response.headers?.location;
           const location = Array.isArray(locationHeader) ? locationHeader[0] : locationHeader;
@@ -248,16 +288,27 @@ function postSoapOnce(endpoint: string, envelope: string, operation: SriOperatio
         console.info(
           `[SRI SOAP] ${operation} response ` +
           `accessKey=${maskAccessKey(accessKey)} attempt=${attempt} ` +
-          `statusHttp=${statusCode} durationMs=${durationMs}\n` +
-          redactDebugXml(responseBody)
+          `statusHttp=${statusCode} durationMs=${durationMs} responseBytes=${size}`
         );
         resolve({ body: responseBody, statusCode, attempts: 1, durationMs });
       });
     });
+    if (typeof (request as any).setTimeout === 'function') {
+      (request as any).setTimeout(readTimeoutMs, () => {
+        request.destroy(Object.assign(new Error('SRI read timeout'), { code: 'ETIMEDOUT', phase: 'read' }));
+      });
+    }
 
-    request.setTimeout(timeoutMs, () => {
-      const error = Object.assign(new Error('SRI request timeout'), { code: 'ETIMEDOUT' });
-      request.destroy(error);
+    connectionTimer = setTimeout(() => {
+      request.destroy(Object.assign(new Error('SRI connection timeout'), { code: 'ETIMEDOUT', phase: 'connect' }));
+    }, connectionTimeoutMs);
+    request.on('socket', (socket: any) => {
+      const connected = () => {
+        clearTimeout(connectionTimer);
+        resetReadTimer();
+      };
+      if (socket.connecting) socket.once('connect', connected);
+      else connected();
     });
     request.on('error', fail);
     request.end(body);
@@ -277,8 +328,10 @@ export async function postSoapWithRetry(wsdlUrl: string, envelope: string, opera
     `endpoint=${endpoint} ` +
     `method=${operation === 'recepcion' ? 'validarComprobante' : 'autorizacionComprobante'}`
   );
-  const configuredTimeout = Number(process.env.SRI_TIMEOUT_MS || 90000);
-  const timeoutMs = options.timeoutMs ?? (Number.isFinite(configuredTimeout) ? Math.min(Math.max(configuredTimeout, 60000), 120000) : 90000);
+  const configuredReadTimeout = Number(options.readTimeoutMs ?? options.timeoutMs ?? process.env.SRI_READ_TIMEOUT_MS ?? 25000);
+  const readTimeoutMs = Number.isFinite(configuredReadTimeout) ? Math.min(Math.max(configuredReadTimeout, 1000), 60000) : 25000;
+  const configuredConnectionTimeout = Number(options.connectionTimeoutMs ?? process.env.SRI_CONNECTION_TIMEOUT_MS ?? 8000);
+  const connectionTimeoutMs = Number.isFinite(configuredConnectionTimeout) ? Math.min(Math.max(configuredConnectionTimeout, 1000), 30000) : 8000;
   const configuredAttempts = Number(options.maxAttempts ?? process.env.SRI_MAX_ATTEMPTS ?? 3);
   const maxAttempts = Number.isFinite(configuredAttempts) ? Math.min(Math.max(configuredAttempts, 1), 3) : 3;
   const configuredBackoff = Number(options.backoffMs ?? 250);
@@ -287,11 +340,11 @@ export async function postSoapWithRetry(wsdlUrl: string, envelope: string, opera
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const response = await postSoapOnce(endpoint, envelope, operation, accessKey, timeoutMs, attempt);
+      const response = await postSoapOnce(endpoint, envelope, operation, accessKey, connectionTimeoutMs, readTimeoutMs, attempt);
       return { ...response, attempts: attempt };
     } catch (error) {
       if (!(error instanceof SriTransportError)) throw error;
-      lastError = new SriTransportError(error.code, error.message, attempt);
+      lastError = new SriTransportError(error.code, error.message, attempt, error.statusCode, error.phase);
       if (attempt >= maxAttempts) throw lastError;
       const waitMs = backoffMs * Math.pow(2, attempt - 1);
       console.info(
@@ -421,6 +474,7 @@ function parseRecepcionResponse(body: string, statusCode: number): any {
   const document = parseSoapDocument(body, statusCode);
   const root = firstElement(document, 'RespuestaRecepcionComprobante');
   const estado = childText(root || document, 'estado');
+
   if (!root || !estado) throw new SriSoapFaultError('La respuesta SOAP de recepción no contiene estado.', statusCode);
 
   const comprobante = firstElement(root, 'comprobante');
@@ -467,26 +521,30 @@ function parseAutorizacionResponse(body: string, statusCode: number): any {
       } : undefined
     }
   };
+
+}
+export function isRetryableSriError(error: unknown): boolean {
+  return error instanceof SriTransportError &&
+    ['SRI_TIMEOUT', 'SRI_CONNECTION_RESET', 'SRI_CONNECTION_REFUSED', 'SRI_PIPE', 'SRI_HTTP_502', 'SRI_HTTP_503', 'SRI_HTTP_504'].includes(error.code);
 }
 
-export async function recepcion(wsdlUrl: string, xmlSigned: string) {
+export async function recepcion(wsdlUrl: string, xmlSigned: string, options: SoapRequestOptions = {}) {
   const accessKey = /<\s*claveAcceso\s*>\s*(\d{49})\s*<\s*\/\s*claveAcceso\s*>/i.exec(xmlSigned)?.[1];
   validateSignedInvoiceXml(xmlSigned, environmentFromWsdl(wsdlUrl));
   console.info(
     `[SRI SOAP] recepcion XML enviado ` +
     `environment=${environmentFromWsdl(wsdlUrl)} ` +
-    `endpoint=${endpointFromWsdl(wsdlUrl)} accessKey=${accessKey || 'unknown'}\n` +
-    redactDebugXml(xmlSigned)
+    `endpoint=${endpointFromWsdl(wsdlUrl)} accessKey=${maskAccessKey(accessKey)} xmlBytes=${Buffer.byteLength(xmlSigned, 'utf8')}`
   );
   const xmlB64 = Buffer.from(xmlSigned, 'utf8').toString('base64');
-  const response = await postSoapWithRetry(wsdlUrl, soapEnvelope('recepcion', xmlB64), 'recepcion', accessKey);
+  const response = await postSoapWithRetry(wsdlUrl, soapEnvelope('recepcion', xmlB64), 'recepcion', accessKey, options);
   try {
     const parsed = parseRecepcionResponse(response.body, response.statusCode);
     const root = parsed?.RespuestaRecepcionComprobante;
     const messages = root?.comprobantes?.comprobante?.mensajes?.mensaje || [];
     console.info(
       `[SRI SOAP] recepcion estado=${root?.estado || 'DESCONOCIDO'} ` +
-      `accessKey=${accessKey || 'unknown'} mensajes=${JSON.stringify(messages)}`
+      `accessKey=${maskAccessKey(accessKey)} mensajes=${JSON.stringify(messages)}`
     );
     return parsed;
   } catch (error) {
@@ -497,20 +555,90 @@ export async function recepcion(wsdlUrl: string, xmlSigned: string) {
   }
 }
 
-export async function autorizacion(wsdlUrl: string, accessKey: string) {
+export async function recepcionConVerificacion(
+  recepcionWsdlUrl: string,
+  autorizacionWsdlUrl: string,
+  xmlSigned: string,
+  options: SoapRequestOptions = {}
+) {
+  const accessKey = /<\s*claveAcceso\s*>\s*(\d{49})\s*<\s*\/\s*claveAcceso\s*>/i.exec(xmlSigned)?.[1];
+  const maxAttempts = Math.min(Math.max(options.maxAttempts ?? 3, 1), 3);
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await recepcion(recepcionWsdlUrl, xmlSigned, { ...options, maxAttempts: 1 });
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableSriError(error) || !accessKey) throw error;
+
+      try {
+        const authorizationResponse = await autorizacion(autorizacionWsdlUrl, accessKey, {
+          ...options,
+          maxAttempts: 1,
+          connectionTimeoutMs: Math.min(options.connectionTimeoutMs ?? 5000, 5000),
+          readTimeoutMs: Math.min(options.readTimeoutMs ?? 8000, 8000)
+        });
+        const authorization = parseAutorizacion(authorizationResponse);
+        console.info(
+          '[SRI RECEPCION VERIFY] accessKey=' + maskAccessKey(accessKey) +
+          ' attempt=' + attempt + ' estado=' + authorization.estado
+        );
+
+        if (authorization.estado === 'AUTORIZADO' ||
+            authorization.estado === 'PENDIENTE' ||
+            authorization.estado === 'NO AUTORIZADO') {
+          return {
+            RespuestaRecepcionComprobante: {
+              estado: 'RECIBIDA',
+              comprobantes: {
+                comprobante: {
+                  estado: 'RECIBIDA',
+                  mensajes: {
+                    mensaje: [{
+                      identificador: 'SRI_RECEPCION_VERIFY',
+                      mensaje: authorization.estado === 'AUTORIZADO'
+                        ? 'El comprobante ya tiene autorización en el SRI.'
+                        : 'La solicitud pudo haber sido recibida; se continuará consultando autorización.'
+                    }]
+                  }
+                }
+              }
+            }
+          };
+        }
+      } catch (verificationError) {
+        const verificationCode = verificationError instanceof SriTransportError
+          ? verificationError.code
+          : 'SRI_VERIFY_ERROR';
+        console.warn(
+          '[SRI RECEPCION VERIFY] accessKey=' + maskAccessKey(accessKey) +
+          ' attempt=' + attempt + ' code=' + verificationCode
+        );
+      }
+
+      if (attempt >= maxAttempts) throw lastError;
+      await wait((options.backoffMs ?? 250) * Math.pow(2, attempt - 1));
+    }
+  }
+
+  throw lastError;
+}
+
+export async function autorizacion(wsdlUrl: string, accessKey: string, options: SoapRequestOptions = {}) {
   console.info(
     `[SRI SOAP] autorizacion consulta ` +
     `environment=${environmentFromWsdl(wsdlUrl)} ` +
-    `endpoint=${endpointFromWsdl(wsdlUrl)} accessKey=${accessKey}`
+    `endpoint=${endpointFromWsdl(wsdlUrl)} accessKey=${maskAccessKey(accessKey)}`
   );
-  const response = await postSoapWithRetry(wsdlUrl, soapEnvelope('autorizacion', accessKey), 'autorizacion', accessKey);
+  const response = await postSoapWithRetry(wsdlUrl, soapEnvelope('autorizacion', accessKey), 'autorizacion', accessKey, options);
   try {
     const parsed = parseAutorizacionResponse(response.body, response.statusCode);
     const authorization = parsed?.RespuestaAutorizacionComprobante?.autorizaciones?.autorizacion;
     const first = Array.isArray(authorization) ? authorization[0] : authorization;
     console.info(
       `[SRI SOAP] autorizacion resultado ` +
-      `environment=${environmentFromWsdl(wsdlUrl)} accessKey=${accessKey} ` +
+      `environment=${environmentFromWsdl(wsdlUrl)} accessKey=${maskAccessKey(accessKey)} ` +
       `attempts=${response.attempts} estado=${first?.estado || 'PENDIENTE'} ` +
       `numeroAutorizacion=${first?.numeroAutorizacion || 'none'} ` +
       `fechaAutorizacion=${first?.fechaAutorizacion || 'none'} ` +
@@ -536,10 +664,10 @@ export async function autorizacionConPolling(
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const startedAt = Date.now();
-    lastResponse = await autorizacion(wsdlUrl, accessKey);
+    lastResponse = await autorizacion(wsdlUrl, accessKey, { maxAttempts: 1 });
     const parsed = parseAutorizacion(lastResponse);
     console.info(
-      `[SRI POLLING] accessKey=${accessKey} attempt=${attempt} ` +
+      `[SRI POLLING] accessKey=${maskAccessKey(accessKey)} attempt=${attempt} ` +
       `estado=${parsed.estado} durationMs=${Date.now() - startedAt}`
     );
 

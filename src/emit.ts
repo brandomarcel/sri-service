@@ -1,5 +1,5 @@
 import { EmitInvoiceOutput } from './types';
-import { recepcion, autorizacion, autorizacionConPolling, isRecibida, parseAutorizacion, SriTransportError, SriSoapFaultError, SriHttpRedirectError, SriXmlValidationError } from './sri';
+import { recepcionConVerificacion, autorizacion, autorizacionConPolling, isRecibida, parseAutorizacion, isRetryableSriError, maskAccessKey, SriTransportError, SriSoapFaultError, SriHttpRedirectError, SriXmlValidationError } from './sri';
 import * as dotenv from 'dotenv';
 import {
   generateInvoiceXML,
@@ -10,7 +10,7 @@ import {
   InvoiceVersion,
   Invoice
 } from 'open-factura-ec';
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { createClient } from 'redis';
 import * as fs from 'fs';
 import * as http from 'http';
@@ -35,13 +35,13 @@ function numeric8FromKey(key: string): string {
 
 const redisClient = createClient({
   url: REDIS_URL,
-  socket: { reconnectStrategy: (retries) => Math.min(retries * 50, 2000) }
+  socket: { reconnectStrategy: (retries) => retries >= 3 ? new Error('Redis unavailable') : Math.min(retries * 50, 2000) }
 });
-redisClient.on('error', (err) => console.error('Redis Client Error:', err));
+redisClient.on('error', (err) => console.error('Redis Client Error:', err instanceof Error ? err.message : 'unknown'));
 let redisConnected = false;
 (async () => {
   try { await redisClient.connect(); redisConnected = true; console.log('Conectado a Redis'); }
-  catch (e) { console.error('Redis no disponible, usando memoria:', e); }
+  catch (e) { console.error('Redis no disponible, usando memoria:', e instanceof Error ? e.message : 'unknown'); }
 })();
 type CachedResponse = EmitInvoiceOutput & { payload_hash?: string };
 const memoryStore = new Map<string, { response: CachedResponse, timestamp: number }>();
@@ -70,6 +70,90 @@ async function setCachedResponse(key: string, response: CachedResponse, ttlSec =
     if (redisConnected) await redisClient.setEx(`idempotency:${key}`, ttlSec, JSON.stringify(response));
     else memoryStore.set(key, { response, timestamp: Date.now() });
   } catch (e) { console.error('Cache set error:', e); }
+}
+
+type DistributedLockToken = {
+  key: string;
+  token: string;
+};
+
+export class SharedStateUnavailableError extends Error {
+  readonly statusCode = 503;
+  readonly code = 'SRI_STATE_UNAVAILABLE' as const;
+
+  constructor() {
+    super('El estado compartido de idempotencia no está disponible.');
+    this.name = 'SharedStateUnavailableError';
+  }
+}
+
+const localLocks = new Map<string, string>();
+
+async function acquireDistributedLock(key: string, requestHash: string): Promise<DistributedLockToken | null> {
+  const token = randomUUID();
+  if (redisConnected) {
+    const result = await redisClient.set('idempotency-lock:' + key, token + ':' + requestHash, {
+      NX: true,
+      EX: 180
+    });
+    return result === 'OK' ? { key, token } : null;
+  }
+
+  if (process.env.NODE_ENV === 'production') {
+    throw new SharedStateUnavailableError();
+  }
+
+  if (localLocks.has(key)) return null;
+  localLocks.set(key, token);
+  return { key, token };
+}
+
+async function releaseDistributedLock(lock: DistributedLockToken): Promise<void> {
+  if (redisConnected) {
+    try {
+      const current = await redisClient.get('idempotency-lock:' + lock.key);
+      if (current?.startsWith(lock.token + ':')) {
+        await redisClient.del('idempotency-lock:' + lock.key);
+      }
+    } catch (error) {
+      console.error('[SRI IDEMPOTENCY] no se pudo liberar el lock compartido:', error instanceof Error ? error.message : 'unknown');
+    }
+    return;
+  }
+  if (localLocks.get(lock.key) === lock.token) localLocks.delete(lock.key);
+}
+
+async function withDistributedLock(
+  payload: any,
+  operation: () => Promise<EmitInvoiceOutput>
+): Promise<EmitInvoiceOutput> {
+  const normalizedPayload = withProviderRuc(payload);
+  const key = documentIdempotencyKey(normalizedPayload);
+  const requestHash = payloadHash(normalizedPayload);
+  const cached = await getCachedResponse(key);
+  if (cached) {
+    if (cached.payload_hash === requestHash) return normalizeCachedResponse(cached);
+    throw new CertificateInputError('La idempotency_key ya está asociada a otro comprobante.');
+  }
+
+  const lock = await acquireDistributedLock(key, requestHash);
+  if (!lock) {
+    const latest = await getCachedResponse(key);
+    if (latest && latest.payload_hash === requestHash) return normalizeCachedResponse(latest);
+    return {
+      ok: true,
+      status: 'PROCESSING',
+      code: 'SRI_IN_PROGRESS',
+      messages: ['El comprobante ya está siendo procesado por otra instancia.'],
+      payload_hash: requestHash
+    };
+  }
+
+  try {
+    return await operation();
+  } finally {
+    await releaseDistributedLock(lock);
+  }
 }
 
 async function fetchAsBase64(url: string): Promise<string> {
@@ -154,7 +238,7 @@ function isPathInside(childPath: string, parentPath: string): boolean {
 }
 
 async function readControlledCertificateFile(filePath: string): Promise<Buffer> {
-  if (!(filePath.startsWith('/') || filePath.startsWith('./'))) {
+  if (!(filePath.startsWith('/') || filePath.startsWith('./') || path.isAbsolute(filePath))) {
     throw new CertificateInputError('La ruta heredada del certificado no tiene un formato permitido.');
   }
 
@@ -241,7 +325,8 @@ type OpenSslResult = { code: number | null; stdout: string; stderr: string };
 
 function runOpenSsl(args: string[], input: string | Buffer): Promise<OpenSslResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn('openssl', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    const executable = process.env.OPENSSL_BIN || (process.platform === 'win32' ? 'C:\\Program Files\\Git\\usr\\bin\\openssl.exe' : 'openssl');
+    const child = spawn(executable, args, { stdio: ['pipe', 'pipe', 'pipe'] });
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     child.stdout.on('data', (chunk) => stdout.push(Buffer.from(chunk)));
@@ -363,6 +448,20 @@ function parseRecepcionMensajes(resp: any): string[] {
   }
 }
 
+function isSriProcessingReception(resp: any): boolean {
+  if (isRecibida(resp)) return true;
+  const raiz = resp?.respuestaRecepcionComprobante ?? resp?.RespuestaRecepcionComprobante ?? resp;
+  const comp = raiz?.comprobantes?.comprobante;
+  const first = Array.isArray(comp) ? comp[0] : comp;
+  const mensajes = first?.mensajes?.mensaje;
+  const list = Array.isArray(mensajes) ? mensajes : mensajes ? [mensajes] : [];
+  return list.some((message: any) => {
+    const code = String(message?.identificador ?? message?.codigo ?? '').trim();
+    return code === '43' || code === '70';
+  });
+}
+
+
 function extractFromXml(xml: string) {
   const key = /<\s*claveAcceso\s*>\s*(\d{49})\s*<\s*\/\s*claveAcceso\s*>/i.exec(xml)?.[1] ?? null;
   const amb = /<\s*ambiente\s*>\s*([12])\s*<\s*\/\s*ambiente\s*>/i.exec(xml)?.[1] ?? null;
@@ -428,8 +527,24 @@ function invoiceIdempotencyKey(payload: any): string {
   return documentIdempotencyKey(payload);
 }
 
+function validateCertificateRequest(payload: any): void {
+  const certificate = payload?.certificate;
+  if (!certificate) throw new CertificateInputError('Falta el certificado.');
+  if (!certificate.password) throw new CertificateInputError('Falta la contraseña del certificado.');
+  if (!certificate.p12_base64 && !certificate.p12_path && !certificate.p12_url) {
+    throw new CertificateInputError('No se proporcionó certificado (p12_base64 o p12_path).');
+  }
+  if (certificate.p12_base64 !== undefined) {
+    const value = String(certificate.p12_base64).trim();
+    const cleanBase64 = extractBase64Payload(value);
+    const isLegacyPath = (value.startsWith('/') || value.startsWith('./')) && !isValidBase64(cleanBase64);
+    if (!isLegacyPath) decodeCertificateBase64(value);
+  }
+}
+
 export async function emitirFactura(payload: any): Promise<EmitInvoiceOutput> {
   payload = withProviderRuc(payload);
+  validateCertificateRequest(payload);
   const idempotencyKey = invoiceIdempotencyKey(payload);
   const requestHash = payloadHash(payload);
   const inFlight = invoicesInFlight.get(idempotencyKey);
@@ -440,7 +555,7 @@ export async function emitirFactura(payload: any): Promise<EmitInvoiceOutput> {
     return inFlight.promise;
   }
 
-  const operation = emitirFacturaInternal(payload);
+  const operation = withDistributedLock(payload, () => emitirFacturaInternal(payload));
   invoicesInFlight.set(idempotencyKey, { payloadHash: requestHash, promise: operation });
   try {
     return await operation;
@@ -482,7 +597,7 @@ function queueAuthorizationPolling(params: {
         };
         console.info(
           `[SRI ASYNC] autorización pendiente ` +
-          `environment=${params.environment} accessKey=${params.accessKey} ` +
+        `environment=${params.environment} accessKey=${maskAccessKey(params.accessKey)} ` +
           `status=PROCESSING message=${out.messages?.join(' | ') || 'none'}`
         );
         await setCachedResponse(params.idempotencyKey, out, 24 * 60 * 60);
@@ -517,13 +632,23 @@ function queueAuthorizationPolling(params: {
       await setCachedResponse(params.idempotencyKey, out, 24 * 60 * 60);
       return out;
     } catch (error) {
-      const out = sriErrorResponse(error, params.accessKey, params.payloadHash);
+      const out: CachedResponse = isRetryableSriError(error)
+        ? {
+            ok: true,
+            status: 'PROCESSING',
+            code: 'SRI_RECEIVED',
+            accessKey: params.accessKey,
+            xml_signed_base64: Buffer.from(params.signedXml).toString('base64'),
+            messages: ['La solicitud pudo haber llegado al SRI; la autorización continuará en segundo plano.'],
+            payload_hash: params.payloadHash
+          }
+        : sriErrorResponse(error, params.accessKey, params.payloadHash) as CachedResponse;
       if (!(error instanceof SriHttpRedirectError)) {
         await setCachedResponse(params.idempotencyKey, out, 24 * 60 * 60);
       }
       console.error(
         `[SRI ASYNC] autorización fallida ` +
-        `environment=${params.environment} accessKey=${params.accessKey} ` +
+        `environment=${params.environment} accessKey=${maskAccessKey(params.accessKey)} ` +
         `code=${out.code || 'SRI_CONNECTION_ERROR'}`
       );
       return out as CachedResponse;
@@ -573,8 +698,8 @@ const numericCode =
       p12_path: certificate.p12_path
     }, certificate.password);
 
-    const rec = await recepcion(recepcionUrl, signedXml);
-    if (!isRecibida(rec)) {
+    const rec = await recepcionConVerificacion(recepcionUrl, autorizacionUrl, signedXml);
+    if (!isSriProcessingReception(rec)) {
       const msgs = parseRecepcionMensajes(rec);
       const out: CachedResponse = {
         ok: false,
@@ -602,7 +727,7 @@ const numericCode =
     };
     console.info(
       `[SRI SOAP] estado PROCESSING guardado ` +
-      `environment=${env} endpoint=${autorizacionUrl} accessKey=${accessKey} ` +
+      `environment=${env} endpoint=${autorizacionUrl} accessKey=${maskAccessKey(accessKey)} ` +
       `message=${processing.messages?.join(' | ') || 'none'}`
     );
     await setCachedResponse(idempotencyKey, processing, 24 * 60 * 60);
@@ -626,10 +751,17 @@ const numericCode =
 
   } catch (error) {
     if (error instanceof CertificateInputError || error instanceof SriXmlValidationError) throw error;
-    const out = sriErrorResponse(error, accessKey, reqHash);
+    const out: CachedResponse = isRetryableSriError(error)
+      ? {
+          ok: true,
+          status: 'PROCESSING',
+          code: 'SRI_RECEIVED',
+          accessKey,
+          messages: ['La solicitud pudo haber llegado al SRI; consulta la autorización con la clave de acceso.'],
+          payload_hash: reqHash
+        }
+      : sriErrorResponse(error, accessKey, reqHash) as CachedResponse;
     if (error instanceof SriTransportError || error instanceof SriSoapFaultError) {
-      // La misma idempotency_key no vuelve a enviar un comprobante cuyo
-      // resultado de transporte/SOAP ya fue determinado.
       await setCachedResponse(idempotencyKey, out, 24 * 60 * 60);
     }
     return out;
@@ -672,8 +804,8 @@ export async function emitirFacturaDesdeXML(payload: {
       urlFirma: payload.urlFirma
     }, password);
 
-    const rec = await recepcion(recepcionUrl, signedXml);
-    if (!isRecibida(rec)) {
+    const rec = await recepcionConVerificacion(recepcionUrl, autorizacionUrl, signedXml);
+    if (!isSriProcessingReception(rec)) {
       const msgs = parseRecepcionMensajes(rec);
       // ⛔ NO cachear transitorio
       return {
@@ -730,7 +862,7 @@ export async function emitirFacturaDesdeXML(payload: {
 
 // ======================= NOTA DE CRÉDITO (JSON) =======================
 
-export async function emitirNotaCredito(payload: any): Promise<EmitInvoiceOutput> {
+async function emitirNotaCreditoInternal(payload: any): Promise<EmitInvoiceOutput> {
   payload = withProviderRuc(payload);
   const idempotencyKey = documentIdempotencyKey(payload);
 
@@ -779,8 +911,8 @@ export async function emitirNotaCredito(payload: any): Promise<EmitInvoiceOutput
       p12_path: certificate.p12_path
     }, certificate.password);
 
-    const rec = await recepcion(recepcionUrl, signedXml);
-    if (!isRecibida(rec)) {
+    const rec = await recepcionConVerificacion(recepcionUrl, autorizacionUrl, signedXml);
+    if (!isSriProcessingReception(rec)) {
       const msgs = parseRecepcionMensajes(rec);
       // ⛔ NO cachear transitorio
       return {
@@ -848,6 +980,12 @@ export async function emitirNotaCredito(payload: any): Promise<EmitInvoiceOutput
 }
 
 
+
+export async function emitirNotaCredito(payload: any): Promise<EmitInvoiceOutput> {
+  const normalizedPayload = withProviderRuc(payload);
+  return withDistributedLock(normalizedPayload, () => emitirNotaCreditoInternal(normalizedPayload));
+}
+
 // ======================= NOTA DE DÉBITO / GUÍA DE REMISIÓN =======================
 
 type XmlDocumentGenerator = (document: any, numericCode: string) => { xml: string; accessKey: string };
@@ -895,8 +1033,8 @@ async function emitirDocumentoGenerado(
       p12_path: certificate.p12_path
     }, certificate.password);
 
-    const rec = await recepcion(recepcionUrl, signedXml);
-    if (!isRecibida(rec)) {
+    const rec = await recepcionConVerificacion(recepcionUrl, autorizacionUrl, signedXml);
+    if (!isSriProcessingReception(rec)) {
       return {
         ok: false,
         status: 'ERROR',
@@ -960,8 +1098,9 @@ async function emitirDocumentoGenerado(
 }
 
 export async function emitirNotaDebito(payload: any): Promise<EmitInvoiceOutput> {
-  return emitirDocumentoGenerado(
-    payload,
+  const normalizedPayload = withProviderRuc(payload);
+  return withDistributedLock(normalizedPayload, () => emitirDocumentoGenerado(
+    normalizedPayload,
     (document, numericCode) => generateDebitNoteXML({
       version: document.version || '1.0.0',
       infoTributaria: document.infoTributaria,
@@ -970,12 +1109,13 @@ export async function emitirNotaDebito(payload: any): Promise<EmitInvoiceOutput>
       infoAdicional: document.infoAdicional
     }, numericCode),
     'la nota de débito'
-  );
+  ));
 }
 
 export async function emitirGuiaRemision(payload: any): Promise<EmitInvoiceOutput> {
-  return emitirDocumentoGenerado(
-    payload,
+  const normalizedPayload = withProviderRuc(payload);
+  return withDistributedLock(normalizedPayload, () => emitirDocumentoGenerado(
+    normalizedPayload,
     (document, numericCode) => generateRemissionGuideXML({
       version: document.version || '1.1.0',
       infoTributaria: document.infoTributaria,
@@ -984,7 +1124,7 @@ export async function emitirGuiaRemision(payload: any): Promise<EmitInvoiceOutpu
       infoAdicional: document.infoAdicional
     }, numericCode),
     'la guía de remisión'
-  );
+  ));
 }
 
 // Utils de estado del servicio

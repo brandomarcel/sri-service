@@ -19,12 +19,14 @@ const { app, invoiceSchema, legacySchema } = require('../dist/server');
 let fixtureDirectory;
 let p12Buffer;
 const password = 'test-password';
+const openssl = process.env.OPENSSL_BIN || (process.platform === 'win32' ? 'C:\\Program Files\\Git\\usr\\bin\\openssl.exe' : 'openssl');
+process.env.OPENSSL_BIN = openssl;
 
 async function makeP12(days = 2) {
   const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'sri-test-'));
-  execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-keyout', path.join(directory, 'key.pem'),
+  execFileSync(openssl, ['req', '-x509', '-newkey', 'rsa:2048', '-keyout', path.join(directory, 'key.pem'),
     '-out', path.join(directory, 'cert.pem'), '-sha256', '-nodes', '-subj', '/CN=SRI test', '-days', String(days)], { stdio: 'ignore' });
-  execFileSync('openssl', ['pkcs12', '-export', '-out', path.join(directory, 'certificate.p12'),
+  execFileSync(openssl, ['pkcs12', '-export', '-out', path.join(directory, 'certificate.p12'),
     '-inkey', path.join(directory, 'key.pem'), '-in', path.join(directory, 'cert.pem'), '-passout', `pass:${password}`], { stdio: 'ignore' });
   return { directory, buffer: await fsp.readFile(path.join(directory, 'certificate.p12')) };
 }
@@ -106,10 +108,13 @@ test('rechaza contraseña incorrecta', async () => {
 });
 
 test('rechaza certificado vencido', async () => {
-  const expired = await makeP12(0);
+  const expired = await makeP12(1);
+  const originalNow = Date.now;
+  Date.now = () => originalNow() + (3 * 24 * 60 * 60 * 1000);
   try {
     await assert.rejects(() => validateCertificateBuffer(expired.buffer, password), /vencido/i);
   } finally {
+    Date.now = originalNow;
     await fsp.rm(expired.directory, { recursive: true, force: true });
   }
 });

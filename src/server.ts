@@ -20,7 +20,7 @@ setNodeDependencies({
 import express from 'express';
 import { z } from 'zod';
 import { emitirFactura, emitirFacturaDesdeXML, emitirNotaCredito, emitirNotaDebito, emitirGuiaRemision } from './emit';
-import { autorizacion, parseAutorizacion,recepcion } from './sri';
+import { autorizacion, parseAutorizacion, maskAccessKey } from './sri';
 import { getSriUrls } from './sri-config';
 
 const app = express();
@@ -305,6 +305,9 @@ app.post('/api/v1/invoices/emit', async (req, res) => {
       issues: errors
     });
   } catch (e: any) {
+    if (e?.statusCode === 503) {
+      return res.status(503).json({ ok: false, status: 'ERROR', code: e.code || 'SRI_STATE_UNAVAILABLE', messages: [e.message] });
+    }
     if (e?.statusCode === 400) {
       return res.status(400).json({ ok: false, status: 'ERROR', code: 'VALIDATION_ERROR', messages: [e.message] });
     }
@@ -326,6 +329,9 @@ app.post('/api/v1/invoices/emit-xml', async (req, res) => {
     });
     return res.json(out);
   } catch (e: any) {
+    if (e?.statusCode === 503) {
+      return res.status(503).json({ ok: false, status: 'ERROR', code: e.code || 'SRI_STATE_UNAVAILABLE', messages: [e.message] });
+    }
     if (e?.statusCode === 400) {
       return res.status(400).json({ ok: false, status: 'ERROR', code: 'VALIDATION_ERROR', messages: [e.message] });
     }
@@ -346,6 +352,9 @@ app.post('/api/v1/credit-notes/emit', async (req, res) => {
     const out = await emitirNotaCredito(parsed.data);
     return res.json(out);
   } catch (e: any) {
+    if (e?.statusCode === 503) {
+      return res.status(503).json({ ok: false, status: 'ERROR', code: e.code || 'SRI_STATE_UNAVAILABLE', messages: [e.message] });
+    }
     if (e?.statusCode === 400) {
       return res.status(400).json({ ok: false, status: 'ERROR', code: 'VALIDATION_ERROR', messages: [e.message] });
     }
@@ -364,6 +373,9 @@ app.post('/api/v1/debit-notes/emit', async (req, res) => {
     }
     return res.json(await emitirNotaDebito(parsed.data));
   } catch (e: any) {
+    if (e?.statusCode === 503) {
+      return res.status(503).json({ ok: false, status: 'ERROR', code: e.code || 'SRI_STATE_UNAVAILABLE', messages: [e.message] });
+    }
     if (e?.statusCode === 400) {
       return res.status(400).json({ ok: false, status: 'ERROR', code: 'VALIDATION_ERROR', messages: [e.message] });
     }
@@ -381,6 +393,9 @@ app.post('/api/v1/remission-guides/emit', async (req, res) => {
     }
     return res.json(await emitirGuiaRemision(parsed.data));
   } catch (e: any) {
+    if (e?.statusCode === 503) {
+      return res.status(503).json({ ok: false, status: 'ERROR', code: e.code || 'SRI_STATE_UNAVAILABLE', messages: [e.message] });
+    }
     if (e?.statusCode === 400) {
       return res.status(400).json({ ok: false, status: 'ERROR', code: 'VALIDATION_ERROR', messages: [e.message] });
     }
@@ -392,7 +407,8 @@ app.post('/api/v1/remission-guides/emit', async (req, res) => {
 // Endpoint de status (sirve para cualquier clave)
 app.get(['/api/v1/invoices/:accessKey/status', '/api/v1/documents/:accessKey/status'], async (req, res) => {
   try {
-    const { accessKey } = req.params;
+    const accessKeyParam = req.params.accessKey;
+    const accessKey = Array.isArray(accessKeyParam) ? accessKeyParam[0] : accessKeyParam;
     const { env } = req.query as { env: 'test' | 'prod' };
 
     if (!/^\d{49}$/.test(accessKey)) {
@@ -411,9 +427,9 @@ app.get(['/api/v1/invoices/:accessKey/status', '/api/v1/documents/:accessKey/sta
       }
       console.info(
         `[SRI STATUS] consulta autorización environment=${amb} ` +
-        `endpoint=${urls.autorizacion} accessKey=${accessKey}`
+        `endpoint=${urls.autorizacion} accessKey=${maskAccessKey(accessKey)}`
       );
-      const authResponse = await autorizacion(urls.autorizacion, accessKey);
+      const authResponse = await autorizacion(urls.autorizacion, accessKey, { maxAttempts: 1 });
       const parsed = parseAutorizacion(authResponse);
 
       if (parsed.estado === 'AUTORIZADO') {
@@ -484,7 +500,7 @@ app.get(['/api/v1/invoices/:accessKey/status', '/api/v1/documents/:accessKey/sta
     return res.json(chosen);
 
   } catch (e: any) {
-    console.error('Error al consultar estado:', e);
+    console.error('[SRI STATUS] consulta fallida', 'code=' + (e?.code || 'UNKNOWN') + ' accessKey=' + maskAccessKey(Array.isArray(req.params.accessKey) ? req.params.accessKey[0] : req.params.accessKey) + ' statusHttp=' + (e?.statusCode || 'none'));
     if (typeof e?.code === 'string' && e.code.startsWith('SRI_')) {
       return res.status(502).json({
         ok: false,

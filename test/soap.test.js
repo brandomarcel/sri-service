@@ -18,7 +18,7 @@ const {
 
 const wsdl = 'https://celcer.sri.gob.ec/comprobantes-electronicos-ws/RecepcionComprobantesOffline?wsdl';
 const authWsdl = 'https://celcer.sri.gob.ec/comprobantes-electronicos-ws/AutorizacionComprobantesOffline?wsdl';
-const accessKey = '2026090201123456789012311001000000001123456781' + '0';
+const accessKey = '2026090201123456789012310010010000000010123456710';
 
 function signedInvoice() {
   return `<factura><infoTributaria><ambiente>1</ambiente><tipoEmision>1</tipoEmision><razonSocial>Empresa</razonSocial><ruc>1234567890123</ruc><claveAcceso>${accessKey}</claveAcceso><codDoc>01</codDoc><estab>001</estab><ptoEmi>001</ptoEmi><secuencial>000000001</secuencial><dirMatriz>Matriz</dirMatriz></infoTributaria><infoFactura><fechaEmision>02/09/2026</fechaEmision><dirEstablecimiento>Establecimiento</dirEstablecimiento><obligadoContabilidad>SI</obligadoContabilidad><tipoIdentificacionComprador>05</tipoIdentificacionComprador><razonSocialComprador>Cliente</razonSocialComprador><identificacionComprador>0102030405</identificacionComprador><totalSinImpuestos>10.00</totalSinImpuestos><totalDescuento>0.00</totalDescuento><propina>0.00</propina><importeTotal>10.00</importeTotal><moneda>DOLAR</moneda><pagos><pago><formaPago>01</formaPago><total>10.00</total></pago></pagos></infoFactura><detalles><detalle><codigoPrincipal>A</codigoPrincipal><descripcion>Producto</descripcion><cantidad>1.00</cantidad><precioUnitario>10.00</precioUnitario><descuento>0.00</descuento><precioTotalSinImpuesto>10.00</precioTotalSinImpuesto><impuestos><impuesto><codigo>2</codigo><codigoPorcentaje>0</codigoPorcentaje><tarifa>0</tarifa><baseImponible>10.00</baseImponible><valor>0.00</valor></impuesto></impuestos></detalle></detalles><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"/></factura>`;
@@ -106,6 +106,22 @@ test('clasifica timeout y reintenta solo errores transitorios', async () => {
   }
 });
 
+
+test('reintenta HTTP 503 como error transitorio y limita a tres intentos', async () => {
+  const mock = mockHttps(({ callback }) => callback(soapResponse('', 503)));
+  try {
+    await assert.rejects(
+      () => postSoapWithRetry(wsdl, '<soap/>', 'recepcion', accessKey, { maxAttempts: 3, backoffMs: 0 }),
+      (error) => error instanceof SriTransportError &&
+        error.code === 'SRI_HTTP_503' &&
+        error.attempts === 3 &&
+        error.statusCode === 503
+    );
+    assert.equal(mock.calls.length, 3);
+  } finally {
+    mock.restore();
+  }
+});
 test('clasifica HTTP 302 como redirección y no sigue la IP ni reintenta', async () => {
   const mock = mockHttps(({ callback }) => callback(soapResponse('', 302, {
     location: 'https://181.113.227.222'
