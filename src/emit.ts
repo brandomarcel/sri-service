@@ -1048,47 +1048,39 @@ async function emitirDocumentoGenerado(
       };
     }
 
-    const auth = await autorizacion(autorizacionUrl, accessKey);
-    const parsed = parseAutorizacion(auth);
-
-    if (parsed.estado === 'PENDIENTE' || parsed.estado === 'DESCONOCIDO') {
-      return {
-        ok: true,
-        status: 'PROCESSING',
-        code: 'SRI_RECEIVED',
-        accessKey,
-        xml_signed_base64: Buffer.from(signedXml).toString('base64'),
-        messages: [parsed.errorMsg || `Esperando autorización de ${label}.`],
-        payload_hash: reqHash
-      };
-    }
-    if (parsed.estado === 'NO AUTORIZADO') {
-      const out: CachedResponse = {
-        ok: false,
-        status: 'NOT_AUTHORIZED',
-        code: 'SRI_REJECTED',
-        accessKey,
-        xml_signed_base64: Buffer.from(signedXml).toString('base64'),
-        messages: [parsed.errorMsg || `${label} no fue autorizado.`],
-        payload_hash: reqHash
-      };
-      await setCachedResponse(idempotencyKey, out, 24 * 60 * 60);
-      return out;
-    }
-
-    const out: CachedResponse = {
+    const processing: CachedResponse = {
       ok: true,
-      status: 'AUTHORIZED',
-      code: 'SRI_AUTHORIZED',
+      status: 'PROCESSING',
+      code: 'SRI_RECEIVED',
       accessKey,
-      authorization: { number: parsed.number, date: parsed.date },
       xml_signed_base64: Buffer.from(signedXml).toString('base64'),
-      xml_authorized_base64: parsed.xmlAut ? Buffer.from(parsed.xmlAut).toString('base64') : undefined,
-      messages: [],
+      messages: [`${label} fue recibida. La autorización se está consultando en segundo plano.`],
       payload_hash: reqHash
     };
-    await setCachedResponse(idempotencyKey, out, 24 * 60 * 60);
-    return out;
+    console.info(
+      `[SRI SOAP] estado PROCESSING guardado ` +
+      `environment=${env} endpoint=${autorizacionUrl} accessKey=${maskAccessKey(accessKey)} ` +
+      `document=${label}`
+    );
+    await setCachedResponse(idempotencyKey, processing, 24 * 60 * 60);
+
+    const authorizationJob = queueAuthorizationPolling({
+      idempotencyKey,
+      authorizationUrl: autorizacionUrl,
+      accessKey,
+      signedXml,
+      payloadHash: reqHash,
+      environment: env
+    });
+
+    // Igual que factura: se espera una ventana corta para obtener AUTORIZADO;
+    // si no termina, el polling continúa y el consumidor consulta el estado.
+    const completed = await Promise.race([
+      authorizationJob,
+      new Promise<CachedResponse | null>((resolve) => setTimeout(() => resolve(null), 7000))
+    ]);
+    if (completed && completed.status !== 'PROCESSING') return completed;
+    return processing;
   } catch (error) {
     if (error instanceof CertificateInputError || error instanceof SriXmlValidationError) throw error;
     const out = sriErrorResponse(error, accessKey, reqHash);
@@ -1101,6 +1093,7 @@ async function emitirDocumentoGenerado(
 
 export async function emitirNotaDebito(payload: any): Promise<EmitInvoiceOutput> {
   const normalizedPayload = withProviderRuc(payload);
+  validateCertificateRequest(normalizedPayload);
   return withDistributedLock(normalizedPayload, () => emitirDocumentoGenerado(
     normalizedPayload,
     (document, numericCode) => generateDebitNoteXML({
@@ -1116,6 +1109,7 @@ export async function emitirNotaDebito(payload: any): Promise<EmitInvoiceOutput>
 
 export async function emitirGuiaRemision(payload: any): Promise<EmitInvoiceOutput> {
   const normalizedPayload = withProviderRuc(payload);
+  validateCertificateRequest(normalizedPayload);
   return withDistributedLock(normalizedPayload, () => emitirDocumentoGenerado(
     normalizedPayload,
     (document, numericCode) => generateRemissionGuideXML({
