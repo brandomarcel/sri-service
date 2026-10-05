@@ -655,6 +655,10 @@ export async function recepcionConVerificacion(
             authorization.estado === 'PENDIENTE' ||
             authorization.estado === 'NO AUTORIZADO') {
           return {
+            // La autorización confirma que el SRI conoce la clave, pero no es
+            // una respuesta directa de RecepcionComprobantesOffline. Se marca
+            // para que el pipeline no confunda inferencia con RECIBIDA real.
+            __receptionConfirmed: false,
             RespuestaRecepcionComprobante: {
               estado: 'RECIBIDA',
               comprobantes: {
@@ -762,6 +766,32 @@ export function isRecibida(resp: any): boolean {
     resp?.RespuestaRecepcionComprobante?.estado ??
     resp?.RespuestaRecepcionComprobante?.comprobantes?.comprobante?.estado;
   return String(estado || '').toUpperCase().trim() === 'RECIBIDA';
+}
+
+export type SriReceptionStatus = 'RECIBIDA' | 'DEVUELTA' | 'UNKNOWN';
+
+/**
+ * Obtiene el estado de recepción y distingue una respuesta SOAP directa de
+ * la respuesta sintética usada cuando la recepción fue incierta pero una
+ * consulta de autorización encontró la clave.
+ */
+export function getReceptionStatus(resp: any): SriReceptionStatus {
+  if (resp?.__receptionConfirmed === false) return 'UNKNOWN';
+
+  const root = resp?.respuestaRecepcionComprobante
+    ?? resp?.RespuestaRecepcionComprobante
+    ?? resp;
+  const comprobante = root?.comprobantes?.comprobante;
+  const first = Array.isArray(comprobante) ? comprobante[0] : comprobante;
+  const mensajes = first?.mensajes?.mensaje;
+  const listaMensajes = Array.isArray(mensajes) ? mensajes : mensajes ? [mensajes] : [];
+  if (listaMensajes.some((message: any) => ['43', '70'].includes(String(message?.identificador ?? message?.codigo ?? '').trim()))) {
+    return 'UNKNOWN';
+  }
+  const estado = String(root?.estado || '').toUpperCase().trim();
+  if (estado === 'RECIBIDA') return 'RECIBIDA';
+  if (estado === 'DEVUELTA') return 'DEVUELTA';
+  return 'UNKNOWN';
 }
 
 

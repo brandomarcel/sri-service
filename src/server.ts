@@ -452,6 +452,10 @@ app.get(['/api/v1/invoices/:accessKey/status', '/api/v1/documents/:accessKey/sta
             code: 'SRI_AUTHORIZATION_PENDING',
             accessKey,
             environment: amb,
+            reception_status: 'UNKNOWN' as const,
+            reception_confirmed: false,
+            authorization_status: 'PENDIENTE' as const,
+            status_source: 'authorization_query' as const,
             messages: ['La autorización continúa pendiente. El SRI respondió temporalmente con una redirección.']
           };
         }
@@ -464,6 +468,10 @@ app.get(['/api/v1/invoices/:accessKey/status', '/api/v1/documents/:accessKey/sta
           status: 'AUTHORIZED' as const,
           accessKey,
           environment: amb,
+          reception_status: 'UNKNOWN' as const,
+          reception_confirmed: false,
+          authorization_status: 'AUTORIZADO' as const,
+          status_source: 'authorization_query' as const,
           authorization: { number: parsed.number, date: parsed.date },
           xml_authorized_base64: parsed.xmlAut ? Buffer.from(parsed.xmlAut).toString('base64') : undefined,
         };
@@ -473,6 +481,10 @@ app.get(['/api/v1/invoices/:accessKey/status', '/api/v1/documents/:accessKey/sta
           status: 'PROCESSING' as const,
           accessKey,
           environment: amb,
+          reception_status: 'UNKNOWN' as const,
+          reception_confirmed: false,
+          authorization_status: 'PENDIENTE' as const,
+          status_source: 'authorization_query' as const,
           messages: [parsed.errorMsg || 'El comprobante todavía no tiene autorización (pendiente).'],
         };
       }
@@ -481,6 +493,10 @@ app.get(['/api/v1/invoices/:accessKey/status', '/api/v1/documents/:accessKey/sta
           status: 'NOT_AUTHORIZED' as const,
           accessKey,
           environment: amb,
+          reception_status: 'UNKNOWN' as const,
+          reception_confirmed: false,
+          authorization_status: 'NO_AUTORIZADO' as const,
+          status_source: 'authorization_query' as const,
           messages: [parsed.errorMsg || 'El comprobante no fue autorizado.'],
         };
       }
@@ -489,6 +505,10 @@ app.get(['/api/v1/invoices/:accessKey/status', '/api/v1/documents/:accessKey/sta
         status: 'UNKNOWN' as const,
         accessKey,
         environment: amb,
+        reception_status: 'UNKNOWN' as const,
+        reception_confirmed: false,
+        authorization_status: 'UNKNOWN' as const,
+        status_source: 'authorization_query' as const,
         messages: ['Estado de autorización desconocido.'],
       };
     };

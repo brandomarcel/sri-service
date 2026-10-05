@@ -58,12 +58,21 @@ export interface EmitInvoiceInput {
   };
 }
 
+export type ReceptionStatus = 'NOT_SENT' | 'RECIBIDA' | 'DEVUELTA' | 'UNKNOWN';
+export type AuthorizationStatus = 'NOT_REQUESTED' | 'PENDIENTE' | 'AUTORIZADO' | 'NO_AUTORIZADO' | 'UNKNOWN';
+
 export interface EmitInvoiceOutput {
   status: 'AUTHORIZED' | 'PROCESSING' | 'NOT_AUTHORIZED' | 'ERROR' | 'DEVUELTA';
   ok?: boolean;
   code?: string;
   attempts?: number;
   accessKey?: string;
+  /** Estado de la respuesta de RecepcionComprobantesOffline. Campo aditivo para compatibilidad. */
+  reception_status?: ReceptionStatus;
+  /** Estado de la consulta de AutorizacionComprobantesOffline. Campo aditivo para compatibilidad. */
+  authorization_status?: AuthorizationStatus;
+  /** true únicamente cuando la respuesta de recepción del SRI confirmó RECIBIDA. */
+  reception_confirmed?: boolean;
   authorization?: { number: string; date: string };
   xml_signed_base64?: string;
   xml_authorized_base64?: string;

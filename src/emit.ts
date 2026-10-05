@@ -1,5 +1,5 @@
-import { EmitInvoiceOutput } from './types';
-import { recepcionConVerificacion, autorizacion, autorizacionConPolling, isRecibida, parseAutorizacion, isRetryableSriError, maskAccessKey, SriTransportError, SriSoapFaultError, SriHttpRedirectError, SriXmlValidationError } from './sri';
+import { EmitInvoiceOutput, ReceptionStatus, AuthorizationStatus } from './types';
+import { recepcionConVerificacion, autorizacion, autorizacionConPolling, isRecibida, getReceptionStatus, parseAutorizacion, isRetryableSriError, maskAccessKey, SriTransportError, SriSoapFaultError, SriHttpRedirectError, SriXmlValidationError } from './sri';
 import * as dotenv from 'dotenv';
 import {
   generateInvoiceXML,
@@ -45,6 +45,23 @@ let redisConnected = false;
 })();
 type CachedResponse = EmitInvoiceOutput & { payload_hash?: string };
 const memoryStore = new Map<string, { response: CachedResponse, timestamp: number }>();
+
+function stateFields(
+  receptionStatus: ReceptionStatus,
+  authorizationStatus: AuthorizationStatus
+): Pick<EmitInvoiceOutput, 'reception_status' | 'authorization_status' | 'reception_confirmed'> {
+  return {
+    reception_status: receptionStatus,
+    authorization_status: authorizationStatus,
+    reception_confirmed: receptionStatus === 'RECIBIDA'
+  };
+}
+
+function receptionProcessingMessage(label: string, receptionStatus: ReceptionStatus): string {
+  return receptionStatus === 'RECIBIDA'
+    ? `${label} fue recibida. La autorización se está consultando en segundo plano.`
+    : `${label} pudo haber llegado al SRI; la recepción no fue confirmada y la autorización se está consultando.`;
+}
 const cacheCleanupTimer = setInterval(() => {
   const now = Date.now();
   for (const [k,v] of memoryStore.entries()) if (now - v.timestamp > 24*60*60*1000) memoryStore.delete(k);
@@ -642,6 +659,7 @@ function queueAuthorizationPolling(params: {
   signedXml: string;
   payloadHash: string;
   environment: string;
+  receptionStatus: ReceptionStatus;
   context?: PipelineContext;
 }): Promise<CachedResponse> {
   const existingJob = authorizationJobs.get(params.idempotencyKey);
@@ -652,7 +670,9 @@ function queueAuthorizationPolling(params: {
       if (params.context) {
         logPipeline('info', 'authorization.polling.started', params.context, {
           maxAttempts: 3,
-          intervalMs: 5000
+          intervalMs: 5000,
+          receptionStatus: params.receptionStatus,
+          receptionConfirmed: params.receptionStatus === 'RECIBIDA'
         });
       }
       const auth = await autorizacionConPolling(params.authorizationUrl, params.accessKey, {
@@ -676,9 +696,12 @@ function queueAuthorizationPolling(params: {
           status: 'PROCESSING',
           code: 'SRI_RECEIVED',
           accessKey: params.accessKey,
+          ...stateFields(params.receptionStatus, 'PENDIENTE'),
           trace_id: params.context?.traceId,
           xml_signed_base64: Buffer.from(params.signedXml).toString('base64'),
-          messages: [parsed.errorMsg || 'Esperando autorización del SRI.'],
+          messages: [parsed.errorMsg || (params.receptionStatus === 'RECIBIDA'
+            ? 'Esperando autorización del SRI.'
+            : 'Esperando autorización del SRI; recepción no confirmada.')],
           payload_hash: params.payloadHash
         };
         console.info(
@@ -696,6 +719,7 @@ function queueAuthorizationPolling(params: {
           status: 'NOT_AUTHORIZED',
           code: 'SRI_REJECTED',
           accessKey: params.accessKey,
+          ...stateFields(params.receptionStatus, 'NO_AUTORIZADO'),
           trace_id: params.context?.traceId,
           xml_signed_base64: Buffer.from(params.signedXml).toString('base64'),
           messages: [parsed.errorMsg || 'El comprobante no fue autorizado.'],
@@ -710,6 +734,7 @@ function queueAuthorizationPolling(params: {
         status: 'AUTHORIZED',
         code: 'SRI_AUTHORIZED',
         accessKey: params.accessKey,
+        ...stateFields(params.receptionStatus, 'AUTORIZADO'),
         trace_id: params.context?.traceId,
         authorization: { number: parsed.number, date: parsed.date },
         xml_signed_base64: Buffer.from(params.signedXml).toString('base64'),
@@ -726,12 +751,15 @@ function queueAuthorizationPolling(params: {
             status: 'PROCESSING',
             code: error instanceof SriHttpRedirectError ? 'SRI_AUTHORIZATION_PENDING' : 'SRI_RECEIVED',
             accessKey: params.accessKey,
+            ...stateFields(params.receptionStatus, 'PENDIENTE'),
             trace_id: params.context?.traceId,
             xml_signed_base64: Buffer.from(params.signedXml).toString('base64'),
             messages: [
               error instanceof SriHttpRedirectError
                 ? 'La autorización continúa pendiente. El SRI respondió temporalmente con una redirección.'
-                : 'La solicitud pudo haber llegado al SRI; la autorización continuará en segundo plano.'
+                : (params.receptionStatus === 'RECIBIDA'
+                  ? 'La autorización continuará en segundo plano.'
+                  : 'La solicitud pudo haber llegado al SRI; la recepción no fue confirmada.')
             ],
             payload_hash: params.payloadHash
           }
@@ -762,7 +790,7 @@ async function emitirFacturaInternal(payload: any): Promise<EmitInvoiceOutput> {
   const context = pipelineContext(payload, 'factura', env, idempotencyKey);
   let stage = 'input';
   const startedAt = Date.now();
-  logPipeline('info', 'pipeline.started', context, { status: 'RECEIVED' });
+  logPipeline('info', 'pipeline.started', context, { status: 'STARTED' });
 
   const cached = await getCachedResponse(idempotencyKey);
   if (cached) {
@@ -787,6 +815,7 @@ const numericCode =
 
   const sriInvoice: Invoice = { version: version as InvoiceVersion, infoTributaria, infoFactura, detalles, infoAdicional };
   let accessKey: string | undefined;
+  let receptionStatus: ReceptionStatus = 'NOT_SENT';
 
   try {
     stage = 'generation';
@@ -819,9 +848,11 @@ const numericCode =
       traceId: context.traceId,
       documentType: context.documentType
     });
+    receptionStatus = getReceptionStatus(rec);
     logPipeline('info', 'reception.completed', context, {
       durationMs: Date.now() - receptionStartedAt,
-      sriStatus: rec?.RespuestaRecepcionComprobante?.estado || rec?.respuestaRecepcionComprobante?.estado || 'UNKNOWN'
+      sriStatus: receptionStatus,
+      receptionConfirmed: receptionStatus === 'RECIBIDA'
     });
     if (!isSriProcessingReception(rec)) {
       const msgs = parseRecepcionMensajes(rec);
@@ -830,6 +861,7 @@ const numericCode =
         status: 'ERROR',
         code: 'SRI_REJECTED',
         accessKey,
+        ...stateFields(receptionStatus === 'DEVUELTA' ? 'DEVUELTA' : receptionStatus, 'NOT_REQUESTED'),
         trace_id: context.traceId,
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
         messages: msgs,
@@ -847,9 +879,10 @@ const numericCode =
       status: 'PROCESSING',
       code: 'SRI_RECEIVED',
       accessKey,
+      ...stateFields(receptionStatus, 'PENDIENTE'),
       trace_id: context.traceId,
       xml_signed_base64: Buffer.from(signedXml).toString('base64'),
-      messages: ['El comprobante fue recibido. La autorización se está consultando en segundo plano.'],
+      messages: [receptionProcessingMessage('El comprobante', receptionStatus)],
       payload_hash: reqHash
     };
     console.info(
@@ -866,6 +899,7 @@ const numericCode =
       signedXml,
       payloadHash: reqHash,
       environment: env,
+      receptionStatus,
       context
     });
 
@@ -895,7 +929,16 @@ const numericCode =
           status: 'PROCESSING',
           code: 'SRI_RECEIVED',
           accessKey,
-          messages: ['La solicitud pudo haber llegado al SRI; consulta la autorización con la clave de acceso.'],
+          ...stateFields(
+            receptionStatus === 'RECIBIDA'
+              ? 'RECIBIDA'
+              : (stage === 'reception' || stage === 'authorization' ? 'UNKNOWN' : 'NOT_SENT'),
+            'PENDIENTE'
+          ),
+          messages: [receptionProcessingMessage('El comprobante',
+            receptionStatus === 'RECIBIDA'
+              ? 'RECIBIDA'
+              : (stage === 'reception' || stage === 'authorization' ? 'UNKNOWN' : 'NOT_SENT'))],
           payload_hash: reqHash
         }
       : sriErrorResponse(error, accessKey, reqHash) as CachedResponse;
@@ -928,6 +971,7 @@ export async function emitirFacturaDesdeXML(payload: {
 
   const env:any = payload.env || ambiente || 'test';
   const { recepcion: recepcionUrl, autorizacion: autorizacionUrl } = getSriUrls(env);
+  let receptionStatus: ReceptionStatus = 'NOT_SENT';
 
   const cached = await getCachedResponse(idempotencyKey);
   if (cached && cached.payload_hash === reqHash) return cached;
@@ -944,12 +988,14 @@ export async function emitirFacturaDesdeXML(payload: {
     }, password);
 
     const rec = await recepcionConVerificacion(recepcionUrl, autorizacionUrl, signedXml);
+    receptionStatus = getReceptionStatus(rec);
     if (!isSriProcessingReception(rec)) {
       const msgs = parseRecepcionMensajes(rec);
       // ⛔ NO cachear transitorio
       return {
         status: 'ERROR',
         accessKey,
+        ...stateFields(receptionStatus === 'DEVUELTA' ? 'DEVUELTA' : receptionStatus, 'NOT_REQUESTED'),
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
         messages: msgs,
         payload_hash: reqHash
@@ -964,8 +1010,11 @@ export async function emitirFacturaDesdeXML(payload: {
       return {
         status: 'PROCESSING',
         accessKey,
+        ...stateFields(receptionStatus, 'PENDIENTE'),
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
-        messages: [parsed.errorMsg || 'Esperando autorización del SRI.'],
+        messages: [parsed.errorMsg || (receptionStatus === 'RECIBIDA'
+          ? 'Esperando autorización del SRI.'
+          : 'Esperando autorización del SRI; recepción no confirmada.')],
         payload_hash: reqHash
       };
     }
@@ -973,6 +1022,7 @@ export async function emitirFacturaDesdeXML(payload: {
       const out: CachedResponse = {
         status: 'NOT_AUTHORIZED',
         accessKey,
+        ...stateFields(receptionStatus, 'NO_AUTORIZADO'),
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
         messages: [parsed.errorMsg || 'El comprobante no fue autorizado.'],
         payload_hash: reqHash
@@ -984,6 +1034,7 @@ export async function emitirFacturaDesdeXML(payload: {
     const ok: CachedResponse = {
       status: 'AUTHORIZED',
       accessKey,
+      ...stateFields(receptionStatus, 'AUTORIZADO'),
       authorization: { number: parsed.number, date: parsed.date },
       xml_signed_base64: Buffer.from(signedXml).toString('base64'),
       xml_authorized_base64: parsed.xmlAut ? Buffer.from(parsed.xmlAut).toString('base64') : undefined,
@@ -1011,7 +1062,7 @@ async function emitirNotaCreditoInternal(payload: any): Promise<EmitInvoiceOutpu
   const context = pipelineContext(payload, 'nota_credito', env, idempotencyKey);
   let stage = 'input';
   const startedAt = Date.now();
-  logPipeline('info', 'pipeline.started', context, { status: 'RECEIVED' });
+  logPipeline('info', 'pipeline.started', context, { status: 'STARTED' });
 
   const cached = await getCachedResponse(idempotencyKey);
   if (cached && cached.payload_hash === reqHash) {
@@ -1026,6 +1077,7 @@ async function emitirNotaCreditoInternal(payload: any): Promise<EmitInvoiceOutpu
   if (!certificate.password) throw new CertificateInputError('Falta la contraseña del certificado.');
 
   let accessKey: string | undefined;
+  let receptionStatus: ReceptionStatus = 'NOT_SENT';
   try {
     stage = 'generation';
     const generationStartedAt = Date.now();
@@ -1079,9 +1131,11 @@ async function emitirNotaCreditoInternal(payload: any): Promise<EmitInvoiceOutpu
       traceId: context.traceId,
       documentType: context.documentType
     });
+    receptionStatus = getReceptionStatus(rec);
     logPipeline('info', 'reception.completed', context, {
       durationMs: Date.now() - receptionStartedAt,
-      sriStatus: rec?.RespuestaRecepcionComprobante?.estado || rec?.respuestaRecepcionComprobante?.estado || 'UNKNOWN'
+      sriStatus: receptionStatus,
+      receptionConfirmed: receptionStatus === 'RECIBIDA'
     });
     if (!isSriProcessingReception(rec)) {
       const msgs = parseRecepcionMensajes(rec);
@@ -1090,6 +1144,7 @@ async function emitirNotaCreditoInternal(payload: any): Promise<EmitInvoiceOutpu
         status: 'ERROR',
         code: 'SRI_REJECTED',
         accessKey,
+        ...stateFields(receptionStatus === 'DEVUELTA' ? 'DEVUELTA' : receptionStatus, 'NOT_REQUESTED'),
         trace_id: context.traceId,
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
         messages: msgs,
@@ -1120,9 +1175,12 @@ async function emitirNotaCreditoInternal(payload: any): Promise<EmitInvoiceOutpu
         status: 'PROCESSING',
         code: 'SRI_RECEIVED',
         accessKey,
+        ...stateFields(receptionStatus, 'PENDIENTE'),
         trace_id: context.traceId,
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
-        messages: [parsed.errorMsg || 'Esperando autorización del SRI.'],
+        messages: [parsed.errorMsg || (receptionStatus === 'RECIBIDA'
+          ? 'Esperando autorización del SRI.'
+          : 'Esperando autorización del SRI; recepción no confirmada.')],
         payload_hash: reqHash
       };
     }
@@ -1132,6 +1190,7 @@ async function emitirNotaCreditoInternal(payload: any): Promise<EmitInvoiceOutpu
         status: 'NOT_AUTHORIZED',
         code: 'SRI_REJECTED',
         accessKey,
+        ...stateFields(receptionStatus, 'NO_AUTORIZADO'),
         trace_id: context.traceId,
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
         messages: [parsed.errorMsg || 'La nota de crédito no fue autorizada.'],
@@ -1147,6 +1206,7 @@ async function emitirNotaCreditoInternal(payload: any): Promise<EmitInvoiceOutpu
       status: 'AUTHORIZED',
       code: 'SRI_AUTHORIZED',
       accessKey,
+      ...stateFields(receptionStatus, 'AUTORIZADO'),
       trace_id: context.traceId,
       authorization: { number: parsed.number, date: parsed.date },
       xml_signed_base64: Buffer.from(signedXml).toString('base64'),
@@ -1166,6 +1226,12 @@ async function emitirNotaCreditoInternal(payload: any): Promise<EmitInvoiceOutpu
     });
     if (err instanceof CertificateInputError || err instanceof SriXmlValidationError) throw err;
     const out = sriErrorResponse(err, accessKey, reqHash);
+    Object.assign(out, stateFields(
+      receptionStatus !== 'NOT_SENT'
+        ? receptionStatus
+        : (stage === 'reception' || stage === 'authorization' ? 'UNKNOWN' : 'NOT_SENT'),
+      stage === 'authorization' ? 'PENDIENTE' : 'NOT_REQUESTED'
+    ));
     if (err instanceof SriTransportError || err instanceof SriSoapFaultError) {
       out.trace_id = context.traceId;
       await setCachedResponse(idempotencyKey, out, 24 * 60 * 60, context);
@@ -1198,7 +1264,7 @@ async function emitirDocumentoGenerado(
   const context = pipelineContext(payload, label, env, idempotencyKey);
   let stage = 'input';
   const startedAt = Date.now();
-  logPipeline('info', 'pipeline.started', context, { status: 'RECEIVED' });
+  logPipeline('info', 'pipeline.started', context, { status: 'STARTED' });
 
   const cached = await getCachedResponse(idempotencyKey);
   if (cached) {
@@ -1224,6 +1290,7 @@ async function emitirDocumentoGenerado(
     ? payload.numeric_code
     : numeric8FromKey(idempotencyKey);
   let accessKey: string | undefined;
+  let receptionStatus: ReceptionStatus = 'NOT_SENT';
 
   try {
     stage = 'generation';
@@ -1263,12 +1330,11 @@ async function emitirDocumentoGenerado(
       traceId: context.traceId,
       documentType: context.documentType
     });
-    const receptionState = rec?.RespuestaRecepcionComprobante?.estado
-      || rec?.respuestaRecepcionComprobante?.estado
-      || 'UNKNOWN';
+    receptionStatus = getReceptionStatus(rec);
     logPipeline('info', 'reception.completed', context, {
       durationMs: Date.now() - receptionStartedAt,
-      sriStatus: receptionState
+      sriStatus: receptionStatus,
+      receptionConfirmed: receptionStatus === 'RECIBIDA'
     });
     if (!isSriProcessingReception(rec)) {
       const messages = parseRecepcionMensajes(rec);
@@ -1277,6 +1343,7 @@ async function emitirDocumentoGenerado(
         status: 'ERROR',
         code: 'SRI_REJECTED',
         accessKey,
+        ...stateFields(receptionStatus === 'DEVUELTA' ? 'DEVUELTA' : receptionStatus, 'NOT_REQUESTED'),
         trace_id: context.traceId,
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
         messages,
@@ -1293,9 +1360,10 @@ async function emitirDocumentoGenerado(
       status: 'PROCESSING',
       code: 'SRI_RECEIVED',
       accessKey,
+      ...stateFields(receptionStatus, 'PENDIENTE'),
       trace_id: context.traceId,
       xml_signed_base64: Buffer.from(signedXml).toString('base64'),
-      messages: [`${label} fue recibida. La autorización se está consultando en segundo plano.`],
+      messages: [receptionProcessingMessage(label, receptionStatus)],
       payload_hash: reqHash
     };
     await setCachedResponse(idempotencyKey, processing, 24 * 60 * 60, context);
@@ -1313,6 +1381,7 @@ async function emitirDocumentoGenerado(
       signedXml,
       payloadHash: reqHash,
       environment: env,
+      receptionStatus,
       context
     });
 
@@ -1344,6 +1413,12 @@ async function emitirDocumentoGenerado(
     });
     if (error instanceof CertificateInputError || error instanceof SriXmlValidationError) throw error;
     const out = sriErrorResponse(error, accessKey, reqHash);
+    Object.assign(out, stateFields(
+      receptionStatus !== 'NOT_SENT'
+        ? receptionStatus
+        : (stage === 'reception' || stage === 'authorization' ? 'UNKNOWN' : 'NOT_SENT'),
+      stage === 'authorization' ? 'PENDIENTE' : 'NOT_REQUESTED'
+    ));
     if (error instanceof SriTransportError || error instanceof SriSoapFaultError) {
       out.trace_id = context.traceId;
       await setCachedResponse(idempotencyKey, out, 24 * 60 * 60, context);
