@@ -57,19 +57,88 @@ function stableStringify(obj: any): string {
 }
 function payloadHash(payload: any): string {
   const c = { ...payload }; delete c.idempotency_key;
+  delete c.trace_id;
   return createHash('sha256').update(stableStringify(c)).digest('hex');
 }
+
+type PipelineContext = {
+  traceId: string;
+  documentType: string;
+  environment: string;
+  idempotencyKey: string;
+  accessKey?: string;
+};
+
+function maskedIdempotencyKey(value: string): string {
+  return createHash('sha256').update(value).digest('hex').slice(0, 12);
+}
+
+function logPipeline(
+  level: 'info' | 'warn' | 'error',
+  event: string,
+  context: PipelineContext,
+  details: Record<string, unknown> = {}
+): void {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    level,
+    service: 'api-facturacion',
+    event,
+    traceId: context.traceId,
+    documentType: context.documentType,
+    environment: context.environment,
+    idempotencyKeyHash: maskedIdempotencyKey(context.idempotencyKey),
+    ...(context.accessKey ? { accessKey: maskAccessKey(context.accessKey) } : {}),
+    ...details
+  };
+  const line = `[SRI PIPELINE] ${JSON.stringify(entry)}`;
+  if (level === 'error') console.error(line);
+  else if (level === 'warn') console.warn(line);
+  else console.info(line);
+}
+
+function pipelineContext(payload: any, documentType: string, environment: string, idempotencyKey: string): PipelineContext {
+  const suppliedTraceId = typeof payload?.trace_id === 'string' ? payload.trace_id.trim() : '';
+  return {
+    traceId: suppliedTraceId && suppliedTraceId.length <= 128 ? suppliedTraceId : randomUUID(),
+    documentType,
+    environment,
+    idempotencyKey
+  };
+}
+
+function logPipelineError(error: unknown): Record<string, unknown> {
+  const value = error as any;
+  return {
+    code: value?.code || 'UNEXPECTED_ERROR',
+    statusHttp: value?.statusCode,
+    phase: value?.phase,
+    message: publicErrorMessage(error, 'No se pudo completar la etapa del flujo SRI.')
+  };
+}
+
 async function getCachedResponse(key: string): Promise<CachedResponse | null> {
   try {
     if (redisConnected) { const raw = await redisClient.get(`idempotency:${key}`); return raw ? JSON.parse(raw) : null; }
     const m = memoryStore.get(key); return m ? m.response : null;
   } catch { return null; }
 }
-async function setCachedResponse(key: string, response: CachedResponse, ttlSec = 24*60*60) {
+async function setCachedResponse(key: string, response: CachedResponse, ttlSec = 24*60*60, context?: PipelineContext) {
   try {
     if (redisConnected) await redisClient.setEx(`idempotency:${key}`, ttlSec, JSON.stringify(response));
     else memoryStore.set(key, { response, timestamp: Date.now() });
-  } catch (e) { console.error('Cache set error:', e); }
+    if (context) {
+      logPipeline('info', 'state.persisted', context, {
+        status: response.status,
+        code: response.code,
+        stateStore: redisConnected ? 'redis' : 'memory',
+        ttlSec
+      });
+    }
+  } catch (e) {
+    console.error('Cache set error:', e);
+    if (context) logPipeline('error', 'state.persistence_failed', context, logPipelineError(e));
+  }
 }
 
 type DistributedLockToken = {
@@ -573,17 +642,33 @@ function queueAuthorizationPolling(params: {
   signedXml: string;
   payloadHash: string;
   environment: string;
+  context?: PipelineContext;
 }): Promise<CachedResponse> {
   const existingJob = authorizationJobs.get(params.idempotencyKey);
   if (existingJob) return existingJob;
 
   const job = (async () => {
     try {
+      if (params.context) {
+        logPipeline('info', 'authorization.polling.started', params.context, {
+          maxAttempts: 3,
+          intervalMs: 5000
+        });
+      }
       const auth = await autorizacionConPolling(params.authorizationUrl, params.accessKey, {
         maxAttempts: 3,
-        intervalMs: 5000
+        intervalMs: 5000,
+        traceId: params.context?.traceId,
+        documentType: params.context?.documentType
       });
       const parsed = parseAutorizacion(auth);
+      if (params.context) {
+        logPipeline('info', 'authorization.polling.completed', params.context, {
+          status: parsed.estado,
+          authorizationNumberPresent: Boolean(parsed.number),
+          authorizationDatePresent: Boolean(parsed.date)
+        });
+      }
 
       if (parsed.estado === 'PENDIENTE' || parsed.estado === 'DESCONOCIDO') {
         const out: CachedResponse = {
@@ -591,6 +676,7 @@ function queueAuthorizationPolling(params: {
           status: 'PROCESSING',
           code: 'SRI_RECEIVED',
           accessKey: params.accessKey,
+          trace_id: params.context?.traceId,
           xml_signed_base64: Buffer.from(params.signedXml).toString('base64'),
           messages: [parsed.errorMsg || 'Esperando autorización del SRI.'],
           payload_hash: params.payloadHash
@@ -600,7 +686,7 @@ function queueAuthorizationPolling(params: {
         `environment=${params.environment} accessKey=${maskAccessKey(params.accessKey)} ` +
           `status=PROCESSING message=${out.messages?.join(' | ') || 'none'}`
         );
-        await setCachedResponse(params.idempotencyKey, out, 24 * 60 * 60);
+        await setCachedResponse(params.idempotencyKey, out, 24 * 60 * 60, params.context);
         return out;
       }
 
@@ -610,11 +696,12 @@ function queueAuthorizationPolling(params: {
           status: 'NOT_AUTHORIZED',
           code: 'SRI_REJECTED',
           accessKey: params.accessKey,
+          trace_id: params.context?.traceId,
           xml_signed_base64: Buffer.from(params.signedXml).toString('base64'),
           messages: [parsed.errorMsg || 'El comprobante no fue autorizado.'],
           payload_hash: params.payloadHash
         };
-        await setCachedResponse(params.idempotencyKey, out, 24 * 60 * 60);
+        await setCachedResponse(params.idempotencyKey, out, 24 * 60 * 60, params.context);
         return out;
       }
 
@@ -623,13 +710,14 @@ function queueAuthorizationPolling(params: {
         status: 'AUTHORIZED',
         code: 'SRI_AUTHORIZED',
         accessKey: params.accessKey,
+        trace_id: params.context?.traceId,
         authorization: { number: parsed.number, date: parsed.date },
         xml_signed_base64: Buffer.from(params.signedXml).toString('base64'),
         xml_authorized_base64: parsed.xmlAut ? Buffer.from(parsed.xmlAut).toString('base64') : undefined,
         messages: [],
         payload_hash: params.payloadHash
       };
-      await setCachedResponse(params.idempotencyKey, out, 24 * 60 * 60);
+      await setCachedResponse(params.idempotencyKey, out, 24 * 60 * 60, params.context);
       return out;
     } catch (error) {
       const out: CachedResponse = isRetryableSriError(error) || error instanceof SriHttpRedirectError
@@ -638,6 +726,7 @@ function queueAuthorizationPolling(params: {
             status: 'PROCESSING',
             code: error instanceof SriHttpRedirectError ? 'SRI_AUTHORIZATION_PENDING' : 'SRI_RECEIVED',
             accessKey: params.accessKey,
+            trace_id: params.context?.traceId,
             xml_signed_base64: Buffer.from(params.signedXml).toString('base64'),
             messages: [
               error instanceof SriHttpRedirectError
@@ -647,7 +736,7 @@ function queueAuthorizationPolling(params: {
             payload_hash: params.payloadHash
           }
         : sriErrorResponse(error, params.accessKey, params.payloadHash) as CachedResponse;
-      await setCachedResponse(params.idempotencyKey, out, 24 * 60 * 60);
+      await setCachedResponse(params.idempotencyKey, out, 24 * 60 * 60, params.context);
       console.error(
         `[SRI ASYNC] autorización fallida ` +
         `environment=${params.environment} accessKey=${maskAccessKey(params.accessKey)} ` +
@@ -670,10 +759,18 @@ async function emitirFacturaInternal(payload: any): Promise<EmitInvoiceOutput> {
 
   const env = payload.env || 'test';
   const { recepcion: recepcionUrl, autorizacion: autorizacionUrl } = getSriUrls(env);
+  const context = pipelineContext(payload, 'factura', env, idempotencyKey);
+  let stage = 'input';
+  const startedAt = Date.now();
+  logPipeline('info', 'pipeline.started', context, { status: 'RECEIVED' });
 
   const cached = await getCachedResponse(idempotencyKey);
   if (cached) {
-    if (cached.payload_hash === reqHash) return normalizeCachedResponse(cached);
+    if (cached.payload_hash === reqHash) {
+      logPipeline('info', 'idempotency.cache_hit', context, { status: cached.status, code: cached.code });
+      return { ...normalizeCachedResponse(cached), trace_id: cached.trace_id || context.traceId };
+    }
+    logPipeline('warn', 'idempotency.conflict', context, { status: 'ERROR', code: 'VALIDATION_ERROR' });
     throw new CertificateInputError('La idempotency_key ya está asociada a otro comprobante.');
   }
 
@@ -692,15 +789,40 @@ const numericCode =
   let accessKey: string | undefined;
 
   try {
+    stage = 'generation';
+    const generationStartedAt = Date.now();
     const { xml, accessKey: generatedAccessKey } = generateInvoiceXML(sriInvoice, numericCode);
     accessKey = generatedAccessKey;
+    context.accessKey = accessKey;
+    logPipeline('info', 'xml.generated', context, {
+      durationMs: Date.now() - generationStartedAt,
+      xmlBytes: Buffer.byteLength(xml, 'utf8'),
+      numericCodeSource: payload.numeric_code ? 'request' : 'derived'
+    });
+    stage = 'signing';
+    const signingStartedAt = Date.now();
+    logPipeline('info', 'signature.started', context);
     const signedXml = await signXmlWithCertificate(xml, {
       p12_base64: certificate.p12_base64,
       p12_url: certificate.p12_url,
       p12_path: certificate.p12_path
     }, certificate.password);
+    logPipeline('info', 'signature.completed', context, {
+      durationMs: Date.now() - signingStartedAt,
+      signedXmlBytes: Buffer.byteLength(signedXml, 'utf8')
+    });
 
-    const rec = await recepcionConVerificacion(recepcionUrl, autorizacionUrl, signedXml);
+    stage = 'reception';
+    const receptionStartedAt = Date.now();
+    logPipeline('info', 'reception.started', context);
+    const rec = await recepcionConVerificacion(recepcionUrl, autorizacionUrl, signedXml, {
+      traceId: context.traceId,
+      documentType: context.documentType
+    });
+    logPipeline('info', 'reception.completed', context, {
+      durationMs: Date.now() - receptionStartedAt,
+      sriStatus: rec?.RespuestaRecepcionComprobante?.estado || rec?.respuestaRecepcionComprobante?.estado || 'UNKNOWN'
+    });
     if (!isSriProcessingReception(rec)) {
       const msgs = parseRecepcionMensajes(rec);
       const out: CachedResponse = {
@@ -708,10 +830,12 @@ const numericCode =
         status: 'ERROR',
         code: 'SRI_REJECTED',
         accessKey,
+        trace_id: context.traceId,
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
         messages: msgs,
         payload_hash: reqHash
       };
+      logPipeline('warn', 'reception.rejected', context, { code: out.code, messages: msgs });
       await setCachedResponse(idempotencyKey, out, 24 * 60 * 60);
       return out;
     }
@@ -723,6 +847,7 @@ const numericCode =
       status: 'PROCESSING',
       code: 'SRI_RECEIVED',
       accessKey,
+      trace_id: context.traceId,
       xml_signed_base64: Buffer.from(signedXml).toString('base64'),
       messages: ['El comprobante fue recibido. La autorización se está consultando en segundo plano.'],
       payload_hash: reqHash
@@ -732,14 +857,16 @@ const numericCode =
       `environment=${env} endpoint=${autorizacionUrl} accessKey=${maskAccessKey(accessKey)} ` +
       `message=${processing.messages?.join(' | ') || 'none'}`
     );
-    await setCachedResponse(idempotencyKey, processing, 24 * 60 * 60);
+    await setCachedResponse(idempotencyKey, processing, 24 * 60 * 60, context);
+    logPipeline('info', 'authorization.queued', context, { status: processing.status, code: processing.code });
     const authorizationJob = queueAuthorizationPolling({
       idempotencyKey,
       authorizationUrl: autorizacionUrl,
       accessKey: accessKey!,
       signedXml,
       payloadHash: reqHash,
-      environment: env
+      environment: env,
+      context
     });
 
     // Dar una ventana corta para que Frappe reciba AUTORIZADO si el SRI ya
@@ -748,10 +875,19 @@ const numericCode =
       authorizationJob,
       new Promise<CachedResponse | null>((resolve) => setTimeout(() => resolve(null), 7000))
     ]);
-    if (completed && completed.status !== 'PROCESSING') return completed;
+    if (completed && completed.status !== 'PROCESSING') {
+      logPipeline('info', 'pipeline.completed', context, { status: completed.status, code: completed.code, elapsedMs: Date.now() - startedAt });
+      return { ...completed, trace_id: completed.trace_id || context.traceId };
+    }
+    logPipeline('info', 'pipeline.processing', context, { status: processing.status, code: processing.code, elapsedMs: Date.now() - startedAt });
     return processing;
 
   } catch (error) {
+    logPipeline(error instanceof CertificateInputError || error instanceof SriXmlValidationError ? 'warn' : 'error', 'pipeline.failed', context, {
+      stage,
+      durationMs: Date.now() - startedAt,
+      ...logPipelineError(error)
+    });
     if (error instanceof CertificateInputError || error instanceof SriXmlValidationError) throw error;
     const out: CachedResponse = isRetryableSriError(error)
       ? {
@@ -764,7 +900,8 @@ const numericCode =
         }
       : sriErrorResponse(error, accessKey, reqHash) as CachedResponse;
     if (error instanceof SriTransportError || error instanceof SriSoapFaultError) {
-      await setCachedResponse(idempotencyKey, out, 24 * 60 * 60);
+      out.trace_id = context.traceId;
+      await setCachedResponse(idempotencyKey, out, 24 * 60 * 60, context);
     }
     return out;
   }
@@ -871,9 +1008,16 @@ async function emitirNotaCreditoInternal(payload: any): Promise<EmitInvoiceOutpu
   const reqHash = payloadHash(payload);
   const env = payload.env || 'test';
   const { recepcion: recepcionUrl, autorizacion: autorizacionUrl } = getSriUrls(env);
+  const context = pipelineContext(payload, 'nota_credito', env, idempotencyKey);
+  let stage = 'input';
+  const startedAt = Date.now();
+  logPipeline('info', 'pipeline.started', context, { status: 'RECEIVED' });
 
   const cached = await getCachedResponse(idempotencyKey);
-  if (cached && cached.payload_hash === reqHash) return cached;
+  if (cached && cached.payload_hash === reqHash) {
+    logPipeline('info', 'idempotency.cache_hit', context, { status: cached.status, code: cached.code });
+    return { ...normalizeCachedResponse(cached), trace_id: cached.trace_id || context.traceId };
+  }
 
   const { infoTributaria, infoNotaCredito, detalles, infoAdicional, certificate } = payload;
   if (!infoTributaria || !infoNotaCredito || !detalles || !certificate) {
@@ -883,6 +1027,8 @@ async function emitirNotaCreditoInternal(payload: any): Promise<EmitInvoiceOutpu
 
   let accessKey: string | undefined;
   try {
+    stage = 'generation';
+    const generationStartedAt = Date.now();
     const numericCode =
       typeof payload.numeric_code === 'string' && /^\d{8}$/.test(payload.numeric_code)
         ? payload.numeric_code
@@ -906,30 +1052,66 @@ async function emitirNotaCreditoInternal(payload: any): Promise<EmitInvoiceOutpu
       numericCode
     );
     accessKey = generatedAccessKey;
+    context.accessKey = accessKey;
+    logPipeline('info', 'xml.generated', context, {
+      durationMs: Date.now() - generationStartedAt,
+      xmlBytes: Buffer.byteLength(xml, 'utf8'),
+      numericCodeSource: payload.numeric_code ? 'request' : 'derived'
+    });
 
+    stage = 'signing';
+    const signingStartedAt = Date.now();
+    logPipeline('info', 'signature.started', context);
     const signedXml = await signXmlWithCertificate(xml, {
       p12_base64: certificate.p12_base64,
       p12_url: certificate.p12_url,
       p12_path: certificate.p12_path
     }, certificate.password);
+    logPipeline('info', 'signature.completed', context, {
+      durationMs: Date.now() - signingStartedAt,
+      signedXmlBytes: Buffer.byteLength(signedXml, 'utf8')
+    });
 
-    const rec = await recepcionConVerificacion(recepcionUrl, autorizacionUrl, signedXml);
+    stage = 'reception';
+    const receptionStartedAt = Date.now();
+    logPipeline('info', 'reception.started', context);
+    const rec = await recepcionConVerificacion(recepcionUrl, autorizacionUrl, signedXml, {
+      traceId: context.traceId,
+      documentType: context.documentType
+    });
+    logPipeline('info', 'reception.completed', context, {
+      durationMs: Date.now() - receptionStartedAt,
+      sriStatus: rec?.RespuestaRecepcionComprobante?.estado || rec?.respuestaRecepcionComprobante?.estado || 'UNKNOWN'
+    });
     if (!isSriProcessingReception(rec)) {
       const msgs = parseRecepcionMensajes(rec);
-      // ⛔ NO cachear transitorio
-      return {
+      const out: CachedResponse = {
         ok: false,
         status: 'ERROR',
         code: 'SRI_REJECTED',
         accessKey,
+        trace_id: context.traceId,
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
         messages: msgs,
         payload_hash: reqHash
       };
+      logPipeline('warn', 'reception.rejected', context, { code: out.code, messages: msgs });
+      return out;
     }
 
-    const auth = await autorizacion(autorizacionUrl, accessKey);
+    stage = 'authorization';
+    const authorizationStartedAt = Date.now();
+    logPipeline('info', 'authorization.started', context);
+    const auth = await autorizacion(autorizacionUrl, accessKey, {
+      traceId: context.traceId,
+      documentType: context.documentType
+    });
     const parsed = parseAutorizacion(auth);
+    logPipeline('info', 'authorization.completed', context, {
+      durationMs: Date.now() - authorizationStartedAt,
+      status: parsed.estado,
+      authorizationNumberPresent: Boolean(parsed.number)
+    });
 
     if (parsed.estado === 'PENDIENTE' || parsed.estado === 'DESCONOCIDO') {
       // ⛔ NO cachear transitorio
@@ -938,6 +1120,7 @@ async function emitirNotaCreditoInternal(payload: any): Promise<EmitInvoiceOutpu
         status: 'PROCESSING',
         code: 'SRI_RECEIVED',
         accessKey,
+        trace_id: context.traceId,
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
         messages: [parsed.errorMsg || 'Esperando autorización del SRI.'],
         payload_hash: reqHash
@@ -949,11 +1132,13 @@ async function emitirNotaCreditoInternal(payload: any): Promise<EmitInvoiceOutpu
         status: 'NOT_AUTHORIZED',
         code: 'SRI_REJECTED',
         accessKey,
+        trace_id: context.traceId,
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
         messages: [parsed.errorMsg || 'La nota de crédito no fue autorizada.'],
         payload_hash: reqHash
       };
-      await setCachedResponse(idempotencyKey, out, 24 * 60 * 60);
+      logPipeline('warn', 'authorization.rejected', context, { code: out.code, messages: out.messages });
+      await setCachedResponse(idempotencyKey, out, 24 * 60 * 60, context);
       return out;
     }
 
@@ -962,20 +1147,28 @@ async function emitirNotaCreditoInternal(payload: any): Promise<EmitInvoiceOutpu
       status: 'AUTHORIZED',
       code: 'SRI_AUTHORIZED',
       accessKey,
+      trace_id: context.traceId,
       authorization: { number: parsed.number, date: parsed.date },
       xml_signed_base64: Buffer.from(signedXml).toString('base64'),
       xml_authorized_base64: parsed.xmlAut ? Buffer.from(parsed.xmlAut).toString('base64') : undefined,
       messages: [],
       payload_hash: reqHash
     };
-    await setCachedResponse(idempotencyKey, ok, 24 * 60 * 60);
+    await setCachedResponse(idempotencyKey, ok, 24 * 60 * 60, context);
+    logPipeline('info', 'pipeline.completed', context, { status: ok.status, code: ok.code, elapsedMs: Date.now() - startedAt });
     return ok;
 
   } catch (err) {
+    logPipeline(err instanceof CertificateInputError || err instanceof SriXmlValidationError ? 'warn' : 'error', 'pipeline.failed', context, {
+      stage,
+      durationMs: Date.now() - startedAt,
+      ...logPipelineError(err)
+    });
     if (err instanceof CertificateInputError || err instanceof SriXmlValidationError) throw err;
     const out = sriErrorResponse(err, accessKey, reqHash);
     if (err instanceof SriTransportError || err instanceof SriSoapFaultError) {
-      await setCachedResponse(idempotencyKey, out, 24 * 60 * 60);
+      out.trace_id = context.traceId;
+      await setCachedResponse(idempotencyKey, out, 24 * 60 * 60, context);
     }
     return out;
   }
@@ -1002,18 +1195,30 @@ async function emitirDocumentoGenerado(
   const reqHash = payloadHash(payload);
   const env = payload.env || 'test';
   const { recepcion: recepcionUrl, autorizacion: autorizacionUrl } = getSriUrls(env);
+  const context = pipelineContext(payload, label, env, idempotencyKey);
+  let stage = 'input';
+  const startedAt = Date.now();
+  logPipeline('info', 'pipeline.started', context, { status: 'RECEIVED' });
 
   const cached = await getCachedResponse(idempotencyKey);
   if (cached) {
-    if (cached.payload_hash === reqHash) return normalizeCachedResponse(cached);
+    if (cached.payload_hash === reqHash) {
+      logPipeline('info', 'idempotency.cache_hit', context, { status: cached.status, code: cached.code });
+      return { ...normalizeCachedResponse(cached), trace_id: cached.trace_id || context.traceId };
+    }
+    logPipeline('warn', 'idempotency.conflict', context, { status: 'ERROR', code: 'VALIDATION_ERROR' });
     throw new CertificateInputError('La idempotency_key ya está asociada a otro comprobante.');
   }
 
   const { infoTributaria, certificate } = payload;
   if (!infoTributaria || !certificate) {
+    logPipeline('warn', 'validation.failed', context, { code: 'VALIDATION_ERROR', message: `Datos incompletos para ${label}.` });
     throw new CertificateInputError(`Datos incompletos para ${label}.`);
   }
-  if (!certificate.password) throw new CertificateInputError('Falta la contraseña del certificado.');
+  if (!certificate.password) {
+    logPipeline('warn', 'validation.failed', context, { code: 'VALIDATION_ERROR', message: 'Falta la contraseña del certificado.' });
+    throw new CertificateInputError('Falta la contraseña del certificado.');
+  }
 
   const numericCode = typeof payload.numeric_code === 'string' && /^\d{8}$/.test(payload.numeric_code)
     ? payload.numeric_code
@@ -1021,71 +1226,127 @@ async function emitirDocumentoGenerado(
   let accessKey: string | undefined;
 
   try {
+    stage = 'generation';
+    const generationStartedAt = Date.now();
     let generated: { xml: string; accessKey: string };
     try {
       generated = generator(payload, numericCode);
     } catch (error) {
+      logPipeline('error', 'xml.generation_failed', context, { ...logPipelineError(error), durationMs: Date.now() - generationStartedAt });
       throw new CertificateInputError(publicErrorMessage(error, `Datos inválidos para ${label}.`));
     }
     accessKey = generated.accessKey;
+    context.accessKey = accessKey;
+    logPipeline('info', 'xml.generated', context, {
+      durationMs: Date.now() - generationStartedAt,
+      xmlBytes: Buffer.byteLength(generated.xml, 'utf8'),
+      numericCodeSource: payload.numeric_code ? 'request' : 'derived'
+    });
 
+    stage = 'signing';
+    const signingStartedAt = Date.now();
+    logPipeline('info', 'signature.started', context);
     const signedXml = await signXmlWithCertificate(generated.xml, {
       p12_base64: certificate.p12_base64,
       p12_url: certificate.p12_url,
       p12_path: certificate.p12_path
     }, certificate.password);
+    logPipeline('info', 'signature.completed', context, {
+      durationMs: Date.now() - signingStartedAt,
+      signedXmlBytes: Buffer.byteLength(signedXml, 'utf8')
+    });
 
-    const rec = await recepcionConVerificacion(recepcionUrl, autorizacionUrl, signedXml);
+    stage = 'reception';
+    const receptionStartedAt = Date.now();
+    logPipeline('info', 'reception.started', context);
+    const rec = await recepcionConVerificacion(recepcionUrl, autorizacionUrl, signedXml, {
+      traceId: context.traceId,
+      documentType: context.documentType
+    });
+    const receptionState = rec?.RespuestaRecepcionComprobante?.estado
+      || rec?.respuestaRecepcionComprobante?.estado
+      || 'UNKNOWN';
+    logPipeline('info', 'reception.completed', context, {
+      durationMs: Date.now() - receptionStartedAt,
+      sriStatus: receptionState
+    });
     if (!isSriProcessingReception(rec)) {
-      return {
+      const messages = parseRecepcionMensajes(rec);
+      const rejected: CachedResponse = {
         ok: false,
         status: 'ERROR',
         code: 'SRI_REJECTED',
         accessKey,
+        trace_id: context.traceId,
         xml_signed_base64: Buffer.from(signedXml).toString('base64'),
-        messages: parseRecepcionMensajes(rec),
+        messages,
         payload_hash: reqHash
       };
+      logPipeline('warn', 'reception.rejected', context, { code: rejected.code, messages });
+      await setCachedResponse(idempotencyKey, rejected, 24 * 60 * 60, context);
+      return rejected;
     }
 
+    stage = 'state_processing';
     const processing: CachedResponse = {
       ok: true,
       status: 'PROCESSING',
       code: 'SRI_RECEIVED',
       accessKey,
+      trace_id: context.traceId,
       xml_signed_base64: Buffer.from(signedXml).toString('base64'),
       messages: [`${label} fue recibida. La autorización se está consultando en segundo plano.`],
       payload_hash: reqHash
     };
-    console.info(
-      `[SRI SOAP] estado PROCESSING guardado ` +
-      `environment=${env} endpoint=${autorizacionUrl} accessKey=${maskAccessKey(accessKey)} ` +
-      `document=${label}`
-    );
-    await setCachedResponse(idempotencyKey, processing, 24 * 60 * 60);
+    await setCachedResponse(idempotencyKey, processing, 24 * 60 * 60, context);
+    logPipeline('info', 'authorization.queued', context, {
+      status: processing.status,
+      code: processing.code,
+      elapsedMs: Date.now() - startedAt
+    });
 
+    stage = 'authorization';
     const authorizationJob = queueAuthorizationPolling({
       idempotencyKey,
       authorizationUrl: autorizacionUrl,
       accessKey,
       signedXml,
       payloadHash: reqHash,
-      environment: env
+      environment: env,
+      context
     });
 
-    // Igual que factura: se espera una ventana corta para obtener AUTORIZADO;
-    // si no termina, el polling continúa y el consumidor consulta el estado.
+    // Se espera una ventana corta para obtener AUTORIZADO; si no termina,
+    // el polling continúa y el consumidor consulta el estado.
     const completed = await Promise.race([
       authorizationJob,
       new Promise<CachedResponse | null>((resolve) => setTimeout(() => resolve(null), 7000))
     ]);
-    if (completed && completed.status !== 'PROCESSING') return completed;
+    if (completed && completed.status !== 'PROCESSING') {
+      logPipeline('info', 'pipeline.completed', context, {
+        status: completed.status,
+        code: completed.code,
+        elapsedMs: Date.now() - startedAt
+      });
+      return { ...completed, trace_id: completed.trace_id || context.traceId };
+    }
+    logPipeline('info', 'pipeline.processing', context, {
+      status: processing.status,
+      code: processing.code,
+      elapsedMs: Date.now() - startedAt
+    });
     return processing;
   } catch (error) {
+    logPipeline(error instanceof CertificateInputError || error instanceof SriXmlValidationError ? 'warn' : 'error', 'pipeline.failed', context, {
+      stage,
+      durationMs: Date.now() - startedAt,
+      ...logPipelineError(error)
+    });
     if (error instanceof CertificateInputError || error instanceof SriXmlValidationError) throw error;
     const out = sriErrorResponse(error, accessKey, reqHash);
     if (error instanceof SriTransportError || error instanceof SriSoapFaultError) {
-      await setCachedResponse(idempotencyKey, out, 24 * 60 * 60);
+      out.trace_id = context.traceId;
+      await setCachedResponse(idempotencyKey, out, 24 * 60 * 60, context);
     }
     return out;
   }

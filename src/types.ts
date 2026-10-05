@@ -69,6 +69,7 @@ export interface EmitInvoiceOutput {
   xml_authorized_base64?: string;
   messages?: string[];
   payload_hash?: string;
+  trace_id?: string;
   
 }
 

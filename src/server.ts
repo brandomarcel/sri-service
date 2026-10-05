@@ -43,6 +43,7 @@ const certificateSchema = z.object({
 // --- Schema Zod para FACTURA (JSON canónico) ---
 export const invoiceSchema = z.object({
   idempotency_key: z.string().min(6).optional(),
+  trace_id: z.string().max(128).optional(),
   env: z.enum(['test','prod']).optional(),
   numeric_code: z.string().regex(/^\d{8}$/).optional(),
   proveedor_ruc: z.string().regex(/^\d{13}$/).optional(),
@@ -58,6 +59,7 @@ export const invoiceSchema = z.object({
 // --- Schema para el formato legacy ---
 export const legacySchema = z.object({
   idempotency_key: z.string().min(6),
+  trace_id: z.string().max(128).optional(),
   env: z.enum(['test','prod']),
   numeric_code: z.string().regex(/^\d{8}$/).optional(),
   company: z.object({
@@ -109,7 +111,7 @@ export const legacySchema = z.object({
 
 // --- Transformador legacy → nuevo ---
 function transformLegacyToNewFormat(legacyData: z.infer<typeof legacySchema>) {
-  const { company, certificate, invoice, env, idempotency_key, numeric_code } = legacyData;
+  const { company, certificate, invoice, env, idempotency_key, trace_id, numeric_code } = legacyData;
   const [year, month, day] = invoice.issueDate.split('-');
   const fechaEmision = `${day}/${month}/${year}`;
 
@@ -155,6 +157,7 @@ function transformLegacyToNewFormat(legacyData: z.infer<typeof legacySchema>) {
 
   return {
     idempotency_key,
+    trace_id,
     env,
     numeric_code,
     version: '2.1.0',
@@ -197,6 +200,7 @@ function transformLegacyToNewFormat(legacyData: z.infer<typeof legacySchema>) {
 // --- Schema Zod para NOTA DE CRÉDITO (JSON canónico) ---
 const creditNoteSchema = z.object({
   idempotency_key: z.string().min(6).optional(),
+  trace_id: z.string().max(128).optional(),
   env: z.enum(['test','prod']).optional(),
   numeric_code: z.string().regex(/^\d{8}$/).optional(),
   proveedor_ruc: z.string().regex(/^\d{13}$/).optional(),
@@ -215,6 +219,7 @@ const creditNoteSchema = z.object({
 // --- Schemas para NOTA DE DÉBITO y GUÍA DE REMISIÓN ---
 const debitNoteSchema = z.object({
   idempotency_key: z.string().min(6).optional(),
+  trace_id: z.string().max(128).optional(),
   env: z.enum(['test', 'prod']).optional(),
   numeric_code: z.string().regex(/^\d{8}$/).optional(),
   version: z.literal('1.0.0').optional().default('1.0.0'),
@@ -228,6 +233,7 @@ const debitNoteSchema = z.object({
 
 const remissionGuideSchema = z.object({
   idempotency_key: z.string().min(6).optional(),
+  trace_id: z.string().max(128).optional(),
   env: z.enum(['test', 'prod']).optional(),
   numeric_code: z.string().regex(/^\d{8}$/).optional(),
   version: z.enum(['1.0.0', '1.1.0']).optional().default('1.1.0'),

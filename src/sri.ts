@@ -103,11 +103,15 @@ export type SoapRequestOptions = {
   readTimeoutMs?: number;
   maxAttempts?: number;
   backoffMs?: number;
+  traceId?: string;
+  documentType?: string;
 };
 
 export type SriAuthorizationPollingOptions = {
   maxAttempts?: number;
   intervalMs?: number;
+  traceId?: string;
+  documentType?: string;
 };
 
 const sriAgent = new https.Agent({
@@ -158,6 +162,8 @@ function logSoap(operation: SriOperation, wsdlUrl: string, accessKey: string | u
   statusCode?: number;
   code?: string;
   phase?: 'connect' | 'read';
+  traceId?: string;
+  documentType?: string;
 }) {
   const fields = [
     `environment=${environmentFromWsdl(wsdlUrl)}`,
@@ -167,6 +173,8 @@ function logSoap(operation: SriOperation, wsdlUrl: string, accessKey: string | u
     `attempt=${details.attempt}`,
     `durationMs=${details.durationMs}`
   ];
+  if (details.traceId) fields.push(`traceId=${details.traceId}`);
+  if (details.documentType) fields.push(`documentType=${details.documentType}`);
   if (details.phase) fields.push(`phase=${details.phase}`);
   if (details.statusCode !== undefined) fields.push(`statusHttp=${details.statusCode}`);
   if (details.code) fields.push(`code=${details.code}`);
@@ -205,7 +213,7 @@ function httpRetryCode(statusCode: number): SriErrorCode | undefined {
   return undefined;
 }
 
-function postSoapOnce(endpoint: string, envelope: string, operation: SriOperation, accessKey: string | undefined, connectionTimeoutMs: number, readTimeoutMs: number, attempt: number): Promise<SoapHttpResponse> {
+function postSoapOnce(endpoint: string, envelope: string, operation: SriOperation, accessKey: string | undefined, connectionTimeoutMs: number, readTimeoutMs: number, attempt: number, options: SoapRequestOptions): Promise<SoapHttpResponse> {
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
     const body = Buffer.from(envelope, 'utf8');
@@ -225,7 +233,7 @@ function postSoapOnce(endpoint: string, envelope: string, operation: SriOperatio
       const code = transportCode(error);
       clearTimeout(connectionTimer);
       clearTimeout(readTimer);
-      logSoap(operation, endpoint, accessKey, { attempt, durationMs, code, phase: error?.phase });
+      logSoap(operation, endpoint, accessKey, { attempt, durationMs, code, phase: error?.phase, traceId: options.traceId, documentType: options.documentType });
       reject(new SriTransportError(code, transportMessage(code), attempt, undefined, error?.phase));
     };
     const request = https.request(endpoint, {
@@ -262,10 +270,10 @@ function postSoapOnce(endpoint: string, envelope: string, operation: SriOperatio
         clearTimeout(readTimer);
         const durationMs = Date.now() - startedAt;
         const statusCode = response.statusCode || 0;
-        logSoap(operation, endpoint, accessKey, { attempt, durationMs, statusCode });
+        logSoap(operation, endpoint, accessKey, { attempt, durationMs, statusCode, traceId: options.traceId, documentType: options.documentType });
         const retryCode = httpRetryCode(statusCode);
         if (retryCode) {
-          logSoap(operation, endpoint, accessKey, { attempt, durationMs, statusCode, code: retryCode });
+          logSoap(operation, endpoint, accessKey, { attempt, durationMs, statusCode, code: retryCode, traceId: options.traceId, documentType: options.documentType });
           reject(new SriTransportError(retryCode, transportMessage(retryCode), attempt, statusCode));
           return;
         }
@@ -288,7 +296,8 @@ function postSoapOnce(endpoint: string, envelope: string, operation: SriOperatio
         console.info(
           `[SRI SOAP] ${operation} response ` +
           `accessKey=${maskAccessKey(accessKey)} attempt=${attempt} ` +
-          `statusHttp=${statusCode} durationMs=${durationMs} responseBytes=${size}`
+          `statusHttp=${statusCode} durationMs=${durationMs} responseBytes=${size} ` +
+          `traceId=${options.traceId || 'none'} documentType=${options.documentType || 'unknown'}`
         );
         resolve({ body: responseBody, statusCode, attempts: 1, durationMs });
       });
@@ -326,7 +335,8 @@ export async function postSoapWithRetry(wsdlUrl: string, envelope: string, opera
     `environment=${environmentFromWsdl(wsdlUrl)} ` +
     `wsdlUrl=${wsdlUrl} ` +
     `endpoint=${endpoint} ` +
-    `method=${operation === 'recepcion' ? 'validarComprobante' : 'autorizacionComprobante'}`
+    `method=${operation === 'recepcion' ? 'validarComprobante' : 'autorizacionComprobante'} ` +
+    `traceId=${options.traceId || 'none'} documentType=${options.documentType || 'unknown'}`
   );
   const configuredReadTimeout = Number(options.readTimeoutMs ?? options.timeoutMs ?? process.env.SRI_READ_TIMEOUT_MS ?? 25000);
   const readTimeoutMs = Number.isFinite(configuredReadTimeout) ? Math.min(Math.max(configuredReadTimeout, 1000), 60000) : 25000;
@@ -340,7 +350,7 @@ export async function postSoapWithRetry(wsdlUrl: string, envelope: string, opera
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const response = await postSoapOnce(endpoint, envelope, operation, accessKey, connectionTimeoutMs, readTimeoutMs, attempt);
+      const response = await postSoapOnce(endpoint, envelope, operation, accessKey, connectionTimeoutMs, readTimeoutMs, attempt, options);
       return { ...response, attempts: attempt };
     } catch (error) {
       if (!(error instanceof SriTransportError)) throw error;
@@ -350,7 +360,8 @@ export async function postSoapWithRetry(wsdlUrl: string, envelope: string, opera
       console.info(
         `[SRI SOAP] ${operation} retry ` +
         `accessKey=${maskAccessKey(accessKey)} failedAttempt=${attempt} ` +
-        `nextAttempt=${attempt + 1} waitMs=${waitMs} code=${error.code}`
+        `nextAttempt=${attempt + 1} waitMs=${waitMs} code=${error.code} ` +
+        `traceId=${options.traceId || 'none'} documentType=${options.documentType || 'unknown'}`
       );
       await wait(waitMs);
     }
@@ -585,7 +596,8 @@ export async function recepcion(wsdlUrl: string, xmlSigned: string, options: Soa
   console.info(
     `[SRI SOAP] recepcion XML enviado ` +
     `environment=${environmentFromWsdl(wsdlUrl)} ` +
-    `endpoint=${endpointFromWsdl(wsdlUrl)} accessKey=${maskAccessKey(accessKey)} xmlBytes=${Buffer.byteLength(xmlSigned, 'utf8')}`
+    `endpoint=${endpointFromWsdl(wsdlUrl)} accessKey=${maskAccessKey(accessKey)} xmlBytes=${Buffer.byteLength(xmlSigned, 'utf8')} ` +
+    `traceId=${options.traceId || 'none'} documentType=${options.documentType || 'unknown'}`
   );
   const xmlB64 = Buffer.from(xmlSigned, 'utf8').toString('base64');
   const response = await postSoapWithRetry(wsdlUrl, soapEnvelope('recepcion', xmlB64), 'recepcion', accessKey, options);
@@ -595,7 +607,8 @@ export async function recepcion(wsdlUrl: string, xmlSigned: string, options: Soa
     const messages = root?.comprobantes?.comprobante?.mensajes?.mensaje || [];
     console.info(
       `[SRI SOAP] recepcion estado=${root?.estado || 'DESCONOCIDO'} ` +
-      `accessKey=${maskAccessKey(accessKey)} mensajes=${JSON.stringify(messages)}`
+      `accessKey=${maskAccessKey(accessKey)} mensajes=${JSON.stringify(messages)} ` +
+      `traceId=${options.traceId || 'none'} documentType=${options.documentType || 'unknown'}`
     );
     return parsed;
   } catch (error) {
@@ -633,7 +646,9 @@ export async function recepcionConVerificacion(
         const authorization = parseAutorizacion(authorizationResponse);
         console.info(
           '[SRI RECEPCION VERIFY] accessKey=' + maskAccessKey(accessKey) +
-          ' attempt=' + attempt + ' estado=' + authorization.estado
+          ' attempt=' + attempt + ' estado=' + authorization.estado +
+          ' traceId=' + (options.traceId || 'none') +
+          ' documentType=' + (options.documentType || 'unknown')
         );
 
         if (authorization.estado === 'AUTORIZADO' ||
@@ -664,7 +679,9 @@ export async function recepcionConVerificacion(
           : 'SRI_VERIFY_ERROR';
         console.warn(
           '[SRI RECEPCION VERIFY] accessKey=' + maskAccessKey(accessKey) +
-          ' attempt=' + attempt + ' code=' + verificationCode
+          ' attempt=' + attempt + ' code=' + verificationCode +
+          ' traceId=' + (options.traceId || 'none') +
+          ' documentType=' + (options.documentType || 'unknown')
         );
       }
 
@@ -680,7 +697,8 @@ export async function autorizacion(wsdlUrl: string, accessKey: string, options: 
   console.info(
     `[SRI SOAP] autorizacion consulta ` +
     `environment=${environmentFromWsdl(wsdlUrl)} ` +
-    `endpoint=${endpointFromWsdl(wsdlUrl)} accessKey=${maskAccessKey(accessKey)}`
+    `endpoint=${endpointFromWsdl(wsdlUrl)} accessKey=${maskAccessKey(accessKey)} ` +
+    `traceId=${options.traceId || 'none'} documentType=${options.documentType || 'unknown'}`
   );
   const response = await postSoapWithRetry(wsdlUrl, soapEnvelope('autorizacion', accessKey), 'autorizacion', accessKey, options);
   try {
@@ -693,7 +711,8 @@ export async function autorizacion(wsdlUrl: string, accessKey: string, options: 
       `attempts=${response.attempts} estado=${first?.estado || 'PENDIENTE'} ` +
       `numeroAutorizacion=${first?.numeroAutorizacion || 'none'} ` +
       `fechaAutorizacion=${first?.fechaAutorizacion || 'none'} ` +
-      `mensaje=${first?.mensajes?.mensaje ? JSON.stringify(first.mensajes.mensaje) : 'none'}`
+      `mensaje=${first?.mensajes?.mensaje ? JSON.stringify(first.mensajes.mensaje) : 'none'} ` +
+      `traceId=${options.traceId || 'none'} documentType=${options.documentType || 'unknown'}`
     );
     return parsed;
   } catch (error) {
@@ -715,11 +734,16 @@ export async function autorizacionConPolling(
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const startedAt = Date.now();
-    lastResponse = await autorizacion(wsdlUrl, accessKey, { maxAttempts: 1 });
+    lastResponse = await autorizacion(wsdlUrl, accessKey, {
+      maxAttempts: 1,
+      traceId: options.traceId,
+      documentType: options.documentType
+    });
     const parsed = parseAutorizacion(lastResponse);
     console.info(
       `[SRI POLLING] accessKey=${maskAccessKey(accessKey)} attempt=${attempt} ` +
-      `estado=${parsed.estado} durationMs=${Date.now() - startedAt}`
+      `estado=${parsed.estado} durationMs=${Date.now() - startedAt} ` +
+      `traceId=${options.traceId || 'none'} documentType=${options.documentType || 'unknown'}`
     );
 
     if (parsed.estado === 'AUTORIZADO' || parsed.estado === 'NO AUTORIZADO' || attempt >= maxAttempts) {
